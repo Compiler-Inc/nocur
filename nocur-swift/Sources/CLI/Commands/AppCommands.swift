@@ -72,14 +72,26 @@ extension App {
 
         func run() async throws {
             let builder = XcodeBuildRunner()
-            let result = try await builder.build(
-                projectPath: project,
-                scheme: scheme,
-                configuration: configuration,
-                destinationUDID: destination,
-                clean: clean
-            )
-            print(Output.success(result).json)
+            do {
+                let result = try await builder.build(
+                    projectPath: project,
+                    scheme: scheme,
+                    configuration: configuration,
+                    destinationUDID: destination,
+                    clean: clean
+                )
+                print(Output.success(result).json)
+            } catch let error as NocurError {
+                // Handle build failures with structured error output
+                if case .buildFailed(let errors) = error {
+                    let failureResult = BuildFailureResult(errors: errors)
+                    print(Output.success(failureResult).json)
+                } else {
+                    print(Output<BuildResult>.failure(error.localizedDescription).json)
+                }
+            } catch {
+                print(Output<BuildResult>.failure(error.localizedDescription).json)
+            }
         }
     }
 }

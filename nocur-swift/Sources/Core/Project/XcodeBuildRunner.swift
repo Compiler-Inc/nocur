@@ -34,7 +34,7 @@ public final class XcodeBuildRunner {
         if let udid = destinationUDID {
             destination = "platform=iOS Simulator,id=\(udid)"
         } else {
-            destination = "platform=iOS Simulator,name=iPhone 15 Pro"
+            destination = "platform=iOS Simulator,name=iPhone 16 Pro"
         }
 
         // Construct xcodebuild command
@@ -58,40 +58,16 @@ public final class XcodeBuildRunner {
         }
         args.append("build")
 
-        // Run build and capture output
+        // Run build and capture all output
         let startTime = Date()
-        var warnings = 0
-        var errors = 0
-        var buildErrors: [BuildError] = []
 
-        let exitCode = try await shellStreaming(args) { stdout in
-            // Parse warnings and errors
-            for line in stdout.components(separatedBy: "\n") {
-                if line.contains("warning:") {
-                    warnings += 1
-                } else if line.contains("error:") {
-                    errors += 1
-                    // Parse error details
-                    let error = parseCompileError(line)
-                    if let error = error {
-                        buildErrors.append(error)
-                    }
-                }
-            }
-        } onStderr: { stderr in
-            // Errors also come through stderr
-            for line in stderr.components(separatedBy: "\n") {
-                if line.contains("error:") {
-                    errors += 1
-                    let error = parseCompileError(line)
-                    if let error = error {
-                        buildErrors.append(error)
-                    }
-                }
-            }
-        }
+        let (exitCode, stdout, stderr) = await runBuild(args: args)
 
         let buildTime = Date().timeIntervalSince(startTime)
+
+        // Parse all output for errors and warnings
+        let allOutput = stdout + "\n" + stderr
+        let (buildErrors, warnings) = parseOutput(allOutput)
 
         if exitCode != 0 {
             throw NocurError.buildFailed(errors: buildErrors)
@@ -112,8 +88,56 @@ public final class XcodeBuildRunner {
             bundleId: bundleId,
             buildTime: buildTime,
             warnings: warnings,
-            errors: errors
+            errors: buildErrors.count
         )
+    }
+
+    // MARK: - Build Execution
+
+    private func runBuild(args: [String]) async -> (exitCode: Int32, stdout: String, stderr: String) {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = args
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+            process.environment = ProcessInfo.processInfo.environment
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+                let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+                let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+
+                continuation.resume(returning: (process.terminationStatus, stdout, stderr))
+            } catch {
+                continuation.resume(returning: (-1, "", error.localizedDescription))
+            }
+        }
+    }
+
+    private func parseOutput(_ output: String) -> (errors: [BuildError], warnings: Int) {
+        var errors: [BuildError] = []
+        var warnings = 0
+
+        for line in output.components(separatedBy: "\n") {
+            if line.contains(": warning:") {
+                warnings += 1
+            } else if line.contains(": error:") {
+                if let error = parseCompileError(line) {
+                    errors.append(error)
+                }
+            }
+        }
+
+        return (errors, warnings)
     }
 
     // MARK: - Helpers

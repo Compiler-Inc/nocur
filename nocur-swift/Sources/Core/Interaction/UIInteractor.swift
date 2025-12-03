@@ -1,6 +1,11 @@
 import Foundation
 
-/// Interacts with UI elements in the simulator
+/// Direction for scroll gestures
+public enum ScrollDirection: String, Codable, CaseIterable, Sendable {
+    case up, down, left, right
+}
+
+/// Interacts with UI elements in the simulator using Facebook's idb
 public final class UIInteractor {
 
     public init() {}
@@ -15,12 +20,15 @@ public final class UIInteractor {
     ) async throws -> TapResult {
         let udid = try await resolveSimulator(simulatorUDID)
 
-        // Use simctl to send tap event
+        // idb uses logical points directly (not device pixels)
+        // iPhone 16 Pro: device resolution 1206x2622, logical 393x852 (3x scale)
+        let scale: Double = 3.0
+        let logicalX = Int(x / scale)
+        let logicalY = Int(y / scale)
+
+        // Use idb for reliable touch input
         for _ in 0..<tapCount {
-            _ = try await shell(
-                "xcrun", "simctl", "io", udid, "tap",
-                String(Int(x)), String(Int(y))
-            )
+            _ = try await shell("idb", "ui", "tap", "--udid", udid, String(logicalX), String(logicalY))
         }
 
         return TapResult(x: x, y: y, element: nil)
@@ -50,15 +58,7 @@ public final class UIInteractor {
         let x = element.frame.x + element.frame.width / 2
         let y = element.frame.y + element.frame.height / 2
 
-        // Tap at center
-        for _ in 0..<tapCount {
-            _ = try await shell(
-                "xcrun", "simctl", "io", udid, "tap",
-                String(Int(x)), String(Int(y))
-            )
-        }
-
-        return TapResult(x: x, y: y, element: identifier)
+        return try await tap(x: x, y: y, simulatorUDID: udid, tapCount: tapCount)
     }
 
     public func tapElementByLabel(
@@ -85,15 +85,7 @@ public final class UIInteractor {
         let x = element.frame.x + element.frame.width / 2
         let y = element.frame.y + element.frame.height / 2
 
-        // Tap at center
-        for _ in 0..<tapCount {
-            _ = try await shell(
-                "xcrun", "simctl", "io", udid, "tap",
-                String(Int(x)), String(Int(y))
-            )
-        }
-
-        return TapResult(x: x, y: y, element: label)
+        return try await tap(x: x, y: y, simulatorUDID: udid, tapCount: tapCount)
     }
 
     // MARK: - Scroll
@@ -106,47 +98,33 @@ public final class UIInteractor {
     ) async throws -> ScrollResult {
         let udid = try await resolveSimulator(simulatorUDID)
 
-        // Calculate scroll vectors
-        var deltaX: Double = 0
-        var deltaY: Double = 0
+        // Calculate swipe coordinates using idb
+        // Start from center of screen
+        let scale: Double = 3.0
+        let centerX = 603 / scale  // ~201 logical points
+        let centerY = 1311 / scale // ~437 logical points
+
+        let swipeAmount = amount / scale
+
+        var endX = centerX
+        var endY = centerY
 
         switch direction {
         case .up:
-            deltaY = amount
+            endY = centerY - swipeAmount
         case .down:
-            deltaY = -amount
+            endY = centerY + swipeAmount
         case .left:
-            deltaX = amount
+            endX = centerX - swipeAmount
         case .right:
-            deltaX = -amount
+            endX = centerX + swipeAmount
         }
 
-        // Get start point (center of screen or element)
-        var startX: Double = 196  // Default center X for iPhone
-        var startY: Double = 426  // Default center Y for iPhone
-
-        if let identifier = elementIdentifier {
-            let inspector = ViewInspector()
-            let result = try await inspector.findElements(
-                text: nil,
-                type: nil,
-                identifier: identifier,
-                simulatorUDID: udid
-            )
-
-            if let element = result.matches.first {
-                startX = element.frame.x + element.frame.width / 2
-                startY = element.frame.y + element.frame.height / 2
-            }
-        }
-
-        // Use simctl to send swipe event
-        let endX = startX + deltaX
-        let endY = startY + deltaY
-
+        // Use idb swipe
         _ = try await shell(
-            "xcrun", "simctl", "io", udid, "swipe",
-            String(Int(startX)), String(Int(startY)),
+            "idb", "ui", "swipe",
+            "--udid", udid,
+            String(Int(centerX)), String(Int(centerY)),
             String(Int(endX)), String(Int(endY))
         )
 
@@ -170,21 +148,20 @@ public final class UIInteractor {
                 simulatorUDID: udid,
                 tapCount: 1
             )
-
-            // Small delay for focus
-            try await Task.sleep(nanoseconds: 100_000_000)
+            try await Task.sleep(nanoseconds: 200_000_000)
         }
 
         // Clear existing text if requested
         if clearFirst {
-            // Select all and delete
-            // Note: This is platform-specific and may need adjustment
-            _ = try await shell("xcrun", "simctl", "io", udid, "keyboard", "selectAll")
-            try await Task.sleep(nanoseconds: 50_000_000)
+            // Use idb key events: select all (Cmd+A) then delete
+            _ = try await shell("idb", "ui", "key", "--udid", udid, "4", "--modifier", "command")  // Cmd+A
+            try await Task.sleep(nanoseconds: 100_000_000)
+            _ = try await shell("idb", "ui", "key", "--udid", udid, "42")  // Backspace
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
 
-        // Type text using simctl
-        _ = try await shell("xcrun", "simctl", "io", udid, "keyboard", text)
+        // Type text using idb
+        _ = try await shell("idb", "ui", "text", "--udid", udid, text)
 
         return TypeResult(text: text, element: elementIdentifier, cleared: clearFirst)
     }

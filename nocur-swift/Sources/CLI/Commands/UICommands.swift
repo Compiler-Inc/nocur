@@ -248,9 +248,8 @@ extension UI {
     }
 }
 
-enum ScrollDirection: String, ExpressibleByArgument, Codable {
-    case up, down, left, right
-}
+// Extend Core's ScrollDirection with ArgumentParser support
+extension ScrollDirection: ExpressibleByArgument {}
 
 // MARK: - Type
 

@@ -181,6 +181,7 @@ public struct BuildResult: Encodable {
     }
 }
 
+/// Structured build error with file location for agent consumption
 public struct BuildError: Encodable {
     public let file: String?
     public let line: Int?
@@ -194,6 +195,30 @@ public struct BuildError: Encodable {
         self.column = column
         self.message = message
         self.severity = severity
+    }
+}
+
+/// Result returned when build fails - contains structured errors for agent to fix
+public struct BuildFailureResult: Encodable {
+    public let buildFailed: Bool
+    public let errorCount: Int
+    public let warningCount: Int
+    public let errors: [BuildError]
+    public let summary: String
+
+    public init(errors: [BuildError], warnings: Int = 0) {
+        self.buildFailed = true
+        self.errorCount = errors.count
+        self.warningCount = warnings
+        self.errors = errors
+
+        // Create a summary for quick reading
+        if errors.isEmpty {
+            self.summary = "Build failed with unknown errors"
+        } else {
+            let uniqueFiles = Set(errors.compactMap { $0.file }).count
+            self.summary = "\(errors.count) error(s) in \(uniqueFiles) file(s)"
+        }
     }
 }
 
