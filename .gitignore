@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-ssr/
+*.local
+
+# Tauri
+src-tauri/target/
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# TypeScript
+*.tsbuildinfo
+
+# Swift
+.build/
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+DerivedData/
