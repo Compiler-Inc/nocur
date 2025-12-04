@@ -14,6 +14,10 @@ interface BuildResult {
   success: boolean;
   output: string;
   errors: BuildError[];
+  warnings: number;
+  buildTime: number | null;
+  appPath: string | null;
+  bundleId: string | null;
 }
 
 interface BuildError {
@@ -23,43 +27,27 @@ interface BuildError {
   message: string;
 }
 
-// Mock data - will be replaced with actual project detection
-const mockProject: ProjectInfo | null = {
+// Default project - will be replaced with actual project detection
+const defaultProject: ProjectInfo = {
   name: "NocurTestApp",
-  path: "<REPO_ROOT>/sample-app/NocurTestApp",
+  path: "<REPO_ROOT>/sample-app",
   scheme: "NocurTestApp",
-  bundleId: "com.nocur.testapp",
-};
-
-const mockFiles = [
-  { name: "NocurTestApp", type: "folder", children: [
-    { name: "NocurTestAppApp.swift", type: "file" },
-    { name: "ContentView.swift", type: "file" },
-    { name: "Assets.xcassets", type: "folder" },
-    { name: "Preview Content", type: "folder" },
-  ]},
-  { name: "NocurTestApp.xcodeproj", type: "project" },
-];
-
-const FileIcon = ({ type }: { type: string }) => {
-  const icons: Record<string, string> = {
-    folder: "▸",
-    file: "◦",
-    project: "◎",
-  };
-  return <span className="text-text-tertiary">{icons[type] || "◦"}</span>;
+  bundleId: "com.nocur.NocurTestApp",
 };
 
 export const ProjectPane = () => {
-  const [project] = useState<ProjectInfo | null>(mockProject);
+  const [project] = useState<ProjectInfo | null>(defaultProject);
   const [buildStatus, setBuildStatus] = useState<BuildStatus>("idle");
   const [buildErrors, setBuildErrors] = useState<BuildError[]>([]);
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(["NocurTestApp"]));
+  const [buildTime, setBuildTime] = useState<number | null>(null);
+  const [warnings, setWarnings] = useState(0);
 
   const handleBuild = async () => {
     if (!project) return;
     setBuildStatus("building");
     setBuildErrors([]);
+    setBuildTime(null);
+    setWarnings(0);
 
     try {
       const result = await invoke<BuildResult>("build_project", {
@@ -69,9 +57,13 @@ export const ProjectPane = () => {
 
       if (result.success) {
         setBuildStatus("success");
+        setBuildTime(result.buildTime);
+        setWarnings(result.warnings);
       } else {
         setBuildStatus("failed");
         setBuildErrors(result.errors);
+        setBuildTime(result.buildTime);
+        setWarnings(result.warnings);
       }
     } catch (error) {
       console.error("Build failed:", error);
@@ -84,6 +76,8 @@ export const ProjectPane = () => {
     if (!project) return;
     setBuildStatus("building");
     setBuildErrors([]);
+    setBuildTime(null);
+    setWarnings(0);
 
     try {
       const result = await invoke<BuildResult>("run_project", {
@@ -93,8 +87,13 @@ export const ProjectPane = () => {
 
       if (result.success) {
         setBuildStatus("success");
+        setBuildTime(result.buildTime);
+        setWarnings(result.warnings);
       } else {
         setBuildStatus("failed");
+        setBuildErrors(result.errors);
+        setBuildTime(result.buildTime);
+        setWarnings(result.warnings);
       }
     } catch (error) {
       console.error("Run failed:", error);
@@ -104,63 +103,14 @@ export const ProjectPane = () => {
   };
 
   const statusConfig = {
-    idle: { color: "bg-text-tertiary", text: "No build" },
+    idle: { color: "bg-text-tertiary", text: "Ready" },
     building: { color: "bg-warning animate-pulse", text: "Building..." },
-    success: { color: "bg-success", text: "Build succeeded" },
-    failed: { color: "bg-error", text: "Build failed" },
-  };
-
-  const toggleFolder = (name: string) => {
-    const next = new Set(expandedFolders);
-    if (next.has(name)) {
-      next.delete(name);
-    } else {
-      next.add(name);
-    }
-    setExpandedFolders(next);
-  };
-
-  const renderFile = (file: { name: string; type: string; children?: any[] }, depth = 0) => {
-    const isExpanded = expandedFolders.has(file.name);
-    const hasChildren = file.children && file.children.length > 0;
-
-    return (
-      <div key={file.name}>
-        <button
-          className={`w-full flex items-center gap-2 px-2 py-1 text-xs font-mono hover:bg-hover rounded transition-colors ${
-            file.type === "file" ? "text-text-secondary" : "text-text-primary"
-          }`}
-          style={{ paddingLeft: `${depth * 12 + 8}px` }}
-          onClick={() => hasChildren && toggleFolder(file.name)}
-        >
-          {hasChildren && (
-            <span className={`text-text-tertiary transition-transform ${isExpanded ? "rotate-90" : ""}`}>
-              ▸
-            </span>
-          )}
-          {!hasChildren && <FileIcon type={file.type} />}
-          <span className={hasChildren ? "text-text-primary" : ""}>{file.name}</span>
-        </button>
-        {isExpanded && file.children?.map((child) => renderFile(child, depth + 1))}
-      </div>
-    );
+    success: { color: "bg-success", text: buildTime ? `${buildTime.toFixed(1)}s` : "Succeeded" },
+    failed: { color: "bg-error", text: "Failed" },
   };
 
   return (
-    <div className="flex flex-col h-full bg-surface-base">
-      {/* Header */}
-      <div className="h-12 px-4 flex items-center justify-between border-b border-border bg-surface-raised/50">
-        <div className="flex items-center gap-3">
-          <h2 className="text-sm font-medium text-text-primary">Project</h2>
-          {project && (
-            <span className="text-xs text-text-tertiary font-mono">{project.name}</span>
-          )}
-        </div>
-        <button className="px-2 py-1 text-xs rounded bg-surface-overlay hover:bg-hover text-text-secondary hover:text-text-primary transition-colors">
-          Open...
-        </button>
-      </div>
-
+    <div className="flex flex-col h-full bg-surface-raised">
       {/* Content */}
       <div className="flex-1 overflow-auto">
         {!project ? (
@@ -175,93 +125,83 @@ export const ProjectPane = () => {
             </button>
           </div>
         ) : (
-          <div className="p-2">
-            {/* Project info */}
-            <div className="mb-4 p-3 rounded border border-border bg-surface-raised/30">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-text-tertiary">◎</span>
-                <span className="text-sm font-medium text-text-primary">{project.name}</span>
+          <div className="p-3 space-y-3">
+            {/* Build controls - compact */}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className={`h-2 w-2 rounded-full ${statusConfig[buildStatus].color}`} />
+                <span className="text-xs font-medium text-text-primary">
+                  {statusConfig[buildStatus].text}
+                </span>
+                {warnings > 0 && buildStatus !== "building" && (
+                  <span className="text-xs text-warning">
+                    {warnings} warning{warnings !== 1 ? "s" : ""}
+                  </span>
+                )}
               </div>
-              <div className="space-y-1 text-xs font-mono">
-                <div className="flex items-center gap-2">
-                  <span className="text-text-tertiary w-16">Path</span>
-                  <span className="text-text-tertiary truncate">{project.path}</span>
-                </div>
-                {project.scheme && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-text-tertiary w-16">Scheme</span>
-                    <span className="text-text-secondary">{project.scheme}</span>
-                  </div>
-                )}
-                {project.bundleId && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-text-tertiary w-16">Bundle</span>
-                    <span className="text-text-secondary">{project.bundleId}</span>
-                  </div>
-                )}
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={handleBuild}
+                  disabled={buildStatus === "building"}
+                  className="px-3 py-1.5 text-xs rounded bg-surface-overlay hover:bg-hover text-text-primary transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                >
+                  Build
+                </button>
+                <button
+                  onClick={handleRun}
+                  disabled={buildStatus === "building"}
+                  className="px-3 py-1.5 text-xs rounded bg-accent hover:bg-accent-muted text-surface-base transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                >
+                  ▶ Run
+                </button>
               </div>
             </div>
 
-            {/* Build status */}
-            <div className="mb-4 p-3 rounded border border-border bg-surface-raised/30">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className={`h-2 w-2 rounded-full ${statusConfig[buildStatus].color}`} />
-                  <span className="text-xs text-text-secondary">{statusConfig[buildStatus].text}</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={handleBuild}
-                    disabled={buildStatus === "building"}
-                    className="px-2 py-1 text-xs rounded bg-surface-overlay hover:bg-hover text-text-secondary hover:text-text-primary transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {buildStatus === "building" ? "..." : "Build"}
-                  </button>
-                  <button
-                    onClick={handleRun}
-                    disabled={buildStatus === "building"}
-                    className="px-2 py-1 text-xs rounded bg-surface-overlay hover:bg-hover text-text-secondary hover:text-text-primary transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {buildStatus === "building" ? "..." : "Run"}
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Build errors */}
+            {/* Build errors - compact */}
             {buildErrors.length > 0 && (
-              <div className="mb-4 p-3 rounded border border-error/30 bg-error-muted">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-error text-xs">✗</span>
-                  <span className="text-xs font-medium text-error">{buildErrors.length} error(s)</span>
+              <div className="p-2 rounded border border-error/30 bg-error-muted">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-error text-xs font-medium">
+                    {buildErrors.length} error{buildErrors.length !== 1 ? "s" : ""}
+                  </span>
                 </div>
                 <div className="space-y-1 max-h-32 overflow-auto">
-                  {buildErrors.map((error, i) => (
-                    <div key={i} className="text-xs font-mono text-text-secondary">
-                      {error.file && (
-                        <span className="text-text-tertiary">{error.file.split('/').pop()}:{error.line}: </span>
-                      )}
-                      <span className="text-error">{error.message}</span>
+                  {buildErrors.slice(0, 3).map((error, i) => (
+                    <div key={i} className="text-[11px] font-mono text-error truncate">
+                      {error.file && `${error.file.split("/").pop()}:${error.line}: `}
+                      {error.message}
                     </div>
                   ))}
+                  {buildErrors.length > 3 && (
+                    <div className="text-[11px] text-text-tertiary">
+                      +{buildErrors.length - 3} more errors
+                    </div>
+                  )}
                 </div>
               </div>
             )}
 
-            {/* File tree */}
-            <div className="space-y-1">
-              <div className="px-2 py-1 flex items-center justify-between">
-                <span className="text-xs font-medium text-text-tertiary uppercase tracking-wider">
-                  Files
-                </span>
-                <button className="text-text-tertiary hover:text-text-secondary transition-colors">
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeWidth="2" strokeLinecap="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                </button>
+            {/* Project info */}
+            <div className="p-3 rounded border border-border bg-surface-raised/30">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-accent">◎</span>
+                <span className="text-xs font-medium text-text-primary">{project.name}</span>
               </div>
-              <div className="rounded border border-border-subtle bg-surface-raised/20 py-1">
-                {mockFiles.map((file) => renderFile(file))}
+              <div className="space-y-1 text-[11px] font-mono">
+                <div className="flex items-center gap-2">
+                  <span className="text-text-tertiary w-14">Scheme</span>
+                  <span className="text-text-secondary">{project.scheme}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-text-tertiary w-14">Bundle</span>
+                  <span className="text-text-secondary">{project.bundleId}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-text-tertiary w-14">Path</span>
+                  <span className="text-text-tertiary truncate" title={project.path}>
+                    {project.path}
+                  </span>
+                </div>
               </div>
             </div>
           </div>

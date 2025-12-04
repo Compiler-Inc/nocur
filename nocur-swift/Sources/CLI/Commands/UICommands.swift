@@ -74,7 +74,7 @@ extension UI {
         @Flag(name: .long, help: "Include hidden views")
         var includeHidden: Bool = false
 
-        @Flag(name: .long, help: "Include frame coordinates")
+        @Flag(name: .long, inversion: .prefixedNo, help: "Include frame coordinates (default: true)")
         var includeFrames: Bool = true
 
         func run() async throws {

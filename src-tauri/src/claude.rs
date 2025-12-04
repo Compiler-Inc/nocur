@@ -15,6 +15,19 @@ pub struct ClaudeEvent {
     pub tool_input: Option<String>,
     pub is_error: bool,
     pub raw_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    // Token usage fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
 }
 
 /// Input message format for Claude CLI stream-json mode
@@ -40,10 +53,12 @@ pub struct ClaudeSession {
     session_id: String,
     #[allow(dead_code)]
     working_dir: String,
+    #[allow(dead_code)]
+    skip_permissions: bool,
 }
 
 impl ClaudeSession {
-    pub fn new(working_dir: &str, app_handle: AppHandle) -> Result<Self, String> {
+    pub fn new(working_dir: &str, app_handle: AppHandle, skip_permissions: bool) -> Result<Self, String> {
         let session_id = Uuid::new_v4().to_string();
 
         // Enhanced PATH for finding claude binary
@@ -57,14 +72,46 @@ impl ClaudeSession {
         log::info!("Starting Claude session with working_dir: {}", working_dir);
         log::info!("Session ID: {}", session_id);
 
+        // System prompt to inform Claude about nocur-swift iOS tools
+        // Use full path to avoid recompilation via `swift run`
+        let nocur_swift_bin = format!("{}/nocur-swift/.build/release/nocur-swift", working_dir);
+        let nocur_system_prompt = format!(r#"You have access to nocur-swift, a CLI tool for iOS simulator control and app verification. Use it to see what the iOS app looks like and interact with it.
+
+IMPORTANT:
+- Always use the pre-built binary at: {bin}
+- DO NOT use "swift run nocur-swift" as it recompiles every time (slow!)
+- Always verify your iOS work visually with screenshots after making changes.
+
+Available commands:
+- {bin} sim screenshot - Take screenshot of iOS simulator (returns JSON with path)
+- {bin} sim list - List available simulators
+- {bin} sim boot <name> - Boot a simulator
+- {bin} ui hierarchy - Get view hierarchy as structured JSON
+- {bin} ui tap <x> <y> - Tap at screen coordinates
+- {bin} ui type <text> - Type text into focused field
+- {bin} app build --path <project-path> - Build the Xcode project
+- {bin} app launch <bundle-id> - Launch app in simulator
+- {bin} app kill <bundle-id> - Kill running app
+
+After making UI changes, ALWAYS take a screenshot to verify the result. If something looks wrong, use the view hierarchy to debug."#, bin = nocur_swift_bin);
+
         // Spawn Claude in SDK streaming mode
         // This keeps the process alive for multi-turn conversation
-        let mut child = Command::new("claude")
-            .args([
-                "--input-format", "stream-json",
-                "--output-format", "stream-json",
-                "--verbose",
-            ])
+        // Permissions are handled via PreToolUse hook -> Nocur permission server (unless skip_permissions is true)
+        let mut cmd = Command::new("claude");
+        cmd.args([
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--append-system-prompt", &nocur_system_prompt,
+        ]);
+
+        if skip_permissions {
+            cmd.arg("--dangerously-skip-permissions");
+            log::info!("Starting Claude with --dangerously-skip-permissions");
+        }
+
+        let mut child = cmd
             .current_dir(working_dir)
             .env("PATH", &enhanced_path)
             .stdin(Stdio::piped())
@@ -139,6 +186,12 @@ impl ClaudeSession {
                                 tool_input: None,
                                 is_error: true,
                                 raw_json: None,
+                                skills: None,
+                                model: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                                cache_read_tokens: None,
+                                cache_creation_tokens: None,
                             });
                         }
                     }
@@ -157,6 +210,7 @@ impl ClaudeSession {
             stdin_writer: stdin_arc,
             session_id,
             working_dir: working_dir.to_string(),
+            skip_permissions,
         })
     }
 
@@ -198,6 +252,12 @@ impl ClaudeSession {
                 tool_input: None,
                 is_error: false,
                 raw_json: None,
+                skills: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
             });
 
             Ok(())
@@ -231,6 +291,31 @@ impl Drop for ClaudeSession {
     }
 }
 
+/// Extract token usage from a JSON value (looks in "usage" or "message.usage")
+fn extract_token_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    // Try top-level usage first, then message.usage
+    let usage = json.get("usage")
+        .or_else(|| json.get("message").and_then(|m| m.get("usage")));
+
+    let input_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_u64());
+
+    let output_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64());
+
+    let cache_read_tokens = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_u64());
+
+    let cache_creation_tokens = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_u64());
+
+    (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+}
+
 /// Parse a Claude CLI JSON event into our ClaudeEvent structure
 fn parse_claude_event(json: &serde_json::Value, raw_line: &str) -> Option<ClaudeEvent> {
     let event_type = json.get("type")
@@ -239,6 +324,9 @@ fn parse_claude_event(json: &serde_json::Value, raw_line: &str) -> Option<Claude
         .to_string();
 
     log::debug!("Parsing event type: {}", event_type);
+
+    // Extract token usage if present (can appear in various event types)
+    let (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) = extract_token_usage(json);
 
     match event_type.as_str() {
         "assistant" => {
@@ -292,6 +380,12 @@ fn parse_claude_event(json: &serde_json::Value, raw_line: &str) -> Option<Claude
                 tool_input,
                 is_error: false,
                 raw_json: Some(raw_line.to_string()),
+                skills: None,
+                model: None,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
             })
         }
         "result" => {
@@ -307,12 +401,48 @@ fn parse_claude_event(json: &serde_json::Value, raw_line: &str) -> Option<Claude
                 tool_input: None,
                 is_error: false,
                 raw_json: Some(raw_line.to_string()),
+                skills: None,
+                model: None,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
             })
         }
         "system" => {
-            // System init message - could extract session info if needed
+            // System init message - extract skills and model info
             log::info!("Claude system event: {:?}", json);
-            None
+
+            let skills = json.get("skills")
+                .and_then(|s| s.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>());
+
+            let model = json.get("model")
+                .and_then(|m| m.as_str())
+                .map(String::from);
+
+            // Emit system init event with skills
+            if skills.is_some() || model.is_some() {
+                log::info!("Emitting system_init event: skills={:?}, model={:?}", skills, model);
+                Some(ClaudeEvent {
+                    event_type: "system_init".to_string(),
+                    content: String::new(),
+                    tool_name: None,
+                    tool_input: None,
+                    is_error: false,
+                    raw_json: Some(raw_line.to_string()),
+                    skills,
+                    model,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                })
+            } else {
+                None
+            }
         }
         "error" => {
             let content = json.get("error")
@@ -328,10 +458,81 @@ fn parse_claude_event(json: &serde_json::Value, raw_line: &str) -> Option<Claude
                 tool_input: None,
                 is_error: true,
                 raw_json: Some(raw_line.to_string()),
+                skills: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
             })
         }
+        // Handle message_delta events which contain token usage updates
+        "message_delta" => {
+            // Only emit if we have token usage to report
+            if input_tokens.is_some() || output_tokens.is_some() {
+                Some(ClaudeEvent {
+                    event_type: "usage".to_string(),
+                    content: String::new(),
+                    tool_name: None,
+                    tool_input: None,
+                    is_error: false,
+                    raw_json: Some(raw_line.to_string()),
+                    skills: None,
+                    model: None,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                })
+            } else {
+                None
+            }
+        }
+        "user" => {
+            // User events contain tool results - extract the content
+            let content = json.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+                .and_then(|arr| {
+                    arr.iter().find_map(|item| {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                            item.get("content").and_then(|c| {
+                                // Content can be a string or more complex
+                                if let Some(s) = c.as_str() {
+                                    Some(s.to_string())
+                                } else {
+                                    Some(serde_json::to_string(c).unwrap_or_default())
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_default();
+
+            // Only emit if there's actual content (screenshot results, etc.)
+            if !content.is_empty() && content.contains("\"path\"") {
+                Some(ClaudeEvent {
+                    event_type: "tool_result".to_string(),
+                    content,
+                    tool_name: None,
+                    tool_input: None,
+                    is_error: false,
+                    raw_json: Some(raw_line.to_string()),
+                    skills: None,
+                    model: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                })
+            } else {
+                None
+            }
+        }
         _ => {
-            log::debug!("Unknown event type: {}", event_type);
+            log::debug!("Unhandled event type: {}", event_type);
             None
         }
     }
@@ -339,10 +540,26 @@ fn parse_claude_event(json: &serde_json::Value, raw_line: &str) -> Option<Claude
 
 pub struct ClaudeState {
     pub session: Option<ClaudeSession>,
+    pub skills: Vec<String>,
+    pub model: Option<String>,
 }
 
 impl ClaudeState {
     pub fn new() -> Self {
-        Self { session: None }
+        Self {
+            session: None,
+            skills: Vec::new(),
+            model: None,
+        }
+    }
+
+    pub fn set_session_info(&mut self, skills: Vec<String>, model: Option<String>) {
+        self.skills = skills;
+        self.model = model;
+    }
+
+    pub fn clear_session_info(&mut self) {
+        self.skills.clear();
+        self.model = None;
     }
 }
