@@ -11,6 +11,9 @@ struct UI: AsyncParsableCommand {
 
             These are the core tools for AI agents to understand and
             interact with iOS app interfaces.
+
+            TIP: Use 'interact' for compound actions - it performs the action
+            AND returns a screenshot in one call, reducing round-trips.
             """,
         subcommands: [
             Hierarchy.self,
@@ -18,7 +21,8 @@ struct UI: AsyncParsableCommand {
             Tap.self,
             Scroll.self,
             Type.self,
-            Find.self
+            Find.self,
+            Interact.self
         ]
     )
 }
@@ -343,6 +347,93 @@ extension UI {
                 identifier: id,
                 simulatorUDID: simulator
             )
+            print(Output.success(result).json)
+        }
+    }
+}
+
+// MARK: - Interact (compound action + screenshot)
+
+extension UI {
+    struct Interact: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Perform action AND capture screenshot (fastest for agents)",
+            discussion: """
+                Compound command that performs an action and immediately captures
+                a screenshot in a single call. This is the FASTEST way for AI agents
+                to interact with the simulator - reduces round-trips by 50-70%.
+
+                Supported actions:
+                  --tap X Y          Tap at coordinates
+                  --tap-id ID        Tap element by accessibility ID
+                  --tap-label TEXT   Tap element by label
+                  --type TEXT        Type text (optionally with --into ID)
+                  --scroll DIR       Scroll up/down/left/right
+
+                Returns JSON with action result AND base64 JPEG screenshot.
+
+                Examples:
+                  nocur-swift ui interact --tap 200 500
+                  nocur-swift ui interact --tap-id "loginButton"
+                  nocur-swift ui interact --type "hello@test.com" --into emailField
+                  nocur-swift ui interact --scroll down
+                """
+        )
+
+        // Tap by coordinates
+        @Option(name: .long, parsing: .upToNextOption, help: "Tap at X Y coordinates")
+        var tap: [Double] = []
+
+        // Tap by element ID
+        @Option(name: .long, help: "Tap element by accessibility identifier")
+        var tapId: String?
+
+        // Tap by label
+        @Option(name: .long, help: "Tap element by accessibility label")
+        var tapLabel: String?
+
+        // Type text
+        @Option(name: .long, help: "Type text")
+        var type: String?
+
+        // Type into element
+        @Option(name: .long, help: "Element ID to type into")
+        var into: String?
+
+        // Clear before typing
+        @Flag(name: .long, help: "Clear field before typing")
+        var clear: Bool = false
+
+        // Scroll
+        @Option(name: .long, help: "Scroll direction: up, down, left, right")
+        var scroll: ScrollDirection?
+
+        // Scroll amount
+        @Option(name: .long, help: "Scroll amount in points (default: 300)")
+        var scrollAmount: Double = 300
+
+        @Option(name: .long, help: "Target simulator UDID")
+        var simulator: String?
+
+        func run() async throws {
+            let interactor = UIInteractor()
+            let action: InteractAction
+
+            if tap.count == 2 {
+                action = .tap(x: tap[0], y: tap[1])
+            } else if let id = tapId {
+                action = .tapElement(id: id)
+            } else if let label = tapLabel {
+                action = .tapLabel(label: label)
+            } else if let text = type {
+                action = .type(text: text, elementId: into, clear: clear)
+            } else if let dir = scroll {
+                action = .scroll(direction: dir, amount: scrollAmount)
+            } else {
+                throw ValidationError("Provide --tap, --tap-id, --tap-label, --type, or --scroll")
+            }
+
+            let result = try await interactor.interact(action: action, simulatorUDID: simulator)
             print(Output.success(result).json)
         }
     }

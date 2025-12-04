@@ -130,12 +130,16 @@ extension Sim {
             abstract: "Capture simulator screenshot",
             discussion: """
                 Captures a screenshot of the specified or booted simulator.
-                Returns the path to the saved PNG file.
 
-                Example output:
+                Use --base64 to get the image data directly in JSON output
+                (no file operations needed). This is MUCH faster for AI agents.
+
+                Use --jpeg for faster encoding and smaller files (default with --base64).
+
+                Example output (with --base64):
                 {
                   "success": true,
-                  "path": "/var/folders/.../screenshot_1234567890.png",
+                  "base64": "data:image/jpeg;base64,...",
                   "width": 1179,
                   "height": 2556,
                   "simulator": "iPhone 15 Pro"
@@ -149,11 +153,19 @@ extension Sim {
         @Option(name: .shortAndLong, help: "Output path (auto-generated if omitted)")
         var output: String?
 
+        @Flag(name: .long, help: "Output base64-encoded image in JSON (fastest for agents)")
+        var base64: Bool = false
+
+        @Flag(name: .long, help: "Use JPEG format (faster, smaller)")
+        var jpeg: Bool = false
+
         func run() async throws {
             let controller = SimulatorController()
             let result = try await controller.takeScreenshot(
                 udid: udid,
-                outputPath: output
+                outputPath: output,
+                base64Output: base64,
+                useJpeg: jpeg
             )
             print(Output.success(result).json)
         }

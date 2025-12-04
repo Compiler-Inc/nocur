@@ -148,22 +148,79 @@ public final class UIInteractor {
                 simulatorUDID: udid,
                 tapCount: 1
             )
-            try await Task.sleep(nanoseconds: 200_000_000)
+            try await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
 
         // Clear existing text if requested
         if clearFirst {
-            // Use idb key events: select all (Cmd+A) then delete
-            _ = try await shell("idb", "ui", "key", "--udid", udid, "4", "--modifier", "command")  // Cmd+A
-            try await Task.sleep(nanoseconds: 100_000_000)
-            _ = try await shell("idb", "ui", "key", "--udid", udid, "42")  // Backspace
-            try await Task.sleep(nanoseconds: 100_000_000)
+            // Use simctl keysequence - much simpler than idb
+            _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", "cmd-a", "delete")
+            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
         }
 
-        // Type text using idb
-        _ = try await shell("idb", "ui", "text", "--udid", udid, text)
+        // Type text using simctl - faster and more reliable than idb
+        // simctl io send-keys is actually called "keysequence"
+        // We need to escape special characters and use the text input
+        for char in text {
+            if char == " " {
+                _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", "space")
+            } else if char == "\n" {
+                _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", "return")
+            } else if char == "@" {
+                _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", "shift-2")
+            } else {
+                _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", String(char))
+            }
+        }
 
         return TypeResult(text: text, element: elementIdentifier, cleared: clearFirst)
+    }
+
+    // MARK: - Compound Interact (tap/type + screenshot in one call)
+
+    /// Perform an action and immediately take a screenshot - reduces round-trips
+    public func interact(
+        action: InteractAction,
+        simulatorUDID: String?
+    ) async throws -> InteractResult {
+        let udid = try await resolveSimulator(simulatorUDID)
+
+        // Perform the action
+        switch action {
+        case .tap(let x, let y):
+            _ = try await tap(x: x, y: y, simulatorUDID: udid, tapCount: 1)
+
+        case .tapElement(let id):
+            _ = try await tapElement(identifier: id, simulatorUDID: udid, tapCount: 1)
+
+        case .tapLabel(let label):
+            _ = try await tapElementByLabel(label: label, simulatorUDID: udid, tapCount: 1)
+
+        case .type(let text, let elementId, let clear):
+            _ = try await typeText(text, elementIdentifier: elementId, simulatorUDID: udid, clearFirst: clear)
+
+        case .scroll(let direction, let amount):
+            _ = try await scroll(direction: direction, amount: amount, elementIdentifier: nil, simulatorUDID: udid)
+        }
+
+        // Brief delay to let UI settle
+        try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+
+        // Take screenshot immediately
+        let simController = SimulatorController()
+        let screenshot = try await simController.takeScreenshot(
+            udid: udid,
+            outputPath: nil,
+            base64Output: true,
+            useJpeg: true
+        )
+
+        return InteractResult(
+            action: action.description,
+            success: true,
+            screenshot: screenshot,
+            element: action.element
+        )
     }
 
     // MARK: - Helpers
@@ -188,5 +245,33 @@ public final class UIInteractor {
         }
 
         throw NocurError.notFound("No booted simulator found")
+    }
+}
+
+/// Action types for compound interact command
+public enum InteractAction {
+    case tap(x: Double, y: Double)
+    case tapElement(id: String)
+    case tapLabel(label: String)
+    case type(text: String, elementId: String?, clear: Bool)
+    case scroll(direction: ScrollDirection, amount: Double)
+
+    var description: String {
+        switch self {
+        case .tap(let x, let y): return "tap(\(Int(x)), \(Int(y)))"
+        case .tapElement(let id): return "tap(#\(id))"
+        case .tapLabel(let label): return "tap(\"\(label)\")"
+        case .type(let text, _, _): return "type(\"\(text.prefix(20))...\")"
+        case .scroll(let dir, _): return "scroll(\(dir.rawValue))"
+        }
+    }
+
+    public var element: String? {
+        switch self {
+        case .tapElement(let id): return id
+        case .tapLabel(let label): return label
+        case .type(_, let elementId, _): return elementId
+        default: return nil
+        }
     }
 }

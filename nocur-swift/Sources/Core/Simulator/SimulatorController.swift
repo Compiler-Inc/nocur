@@ -133,25 +133,48 @@ public final class SimulatorController {
 
     // MARK: - Screenshot
 
-    public func takeScreenshot(udid: String?, outputPath: String?) async throws -> ScreenshotResult {
+    public func takeScreenshot(udid: String?, outputPath: String?, base64Output: Bool = false, useJpeg: Bool = false) async throws -> ScreenshotResult {
         let targetUDID = try await resolveSimulator(udid)
         let list = try await listSimulators()
         let simName = list.simulators.first { $0.udid == targetUDID }?.name ?? "Unknown"
 
+        let format = useJpeg || base64Output ? "jpeg" : "png"
+        let ext = format == "jpeg" ? "jpg" : "png"
         let path = outputPath ?? FileManager.default.temporaryDirectory
-            .appendingPathComponent("screenshot_\(Int(Date().timeIntervalSince1970)).png")
+            .appendingPathComponent("screenshot_\(Int(Date().timeIntervalSince1970)).\(ext)")
             .path
 
-        _ = try await shell("xcrun", "simctl", "io", targetUDID, "screenshot", path)
+        // simctl supports --type png|jpeg
+        _ = try await shell("xcrun", "simctl", "io", targetUDID, "screenshot", "--type=\(format)", path)
 
         // Get image dimensions
         let (width, height) = try getImageDimensions(path: path)
+
+        if base64Output {
+            // Read file and encode to base64
+            guard let data = FileManager.default.contents(atPath: path) else {
+                throw NocurError.notFound("Screenshot file not found")
+            }
+            let base64String = data.base64EncodedString()
+
+            // Clean up temp file
+            try? FileManager.default.removeItem(atPath: path)
+
+            return ScreenshotResult(
+                base64: "data:image/\(format);base64,\(base64String)",
+                width: width,
+                height: height,
+                simulator: simName,
+                format: format
+            )
+        }
 
         return ScreenshotResult(
             path: path,
             width: width,
             height: height,
-            simulator: simName
+            simulator: simName,
+            format: format
         )
     }
 

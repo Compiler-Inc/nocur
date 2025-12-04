@@ -102,7 +102,8 @@ public struct BootResult: Encodable {
 }
 
 public struct ScreenshotResult: Encodable {
-    public let path: String
+    public let path: String?
+    public let base64: String?
     public let width: Int
     public let height: Int
     public let simulator: String
@@ -110,10 +111,35 @@ public struct ScreenshotResult: Encodable {
 
     public init(path: String, width: Int, height: Int, simulator: String, format: String = "png") {
         self.path = path
+        self.base64 = nil
         self.width = width
         self.height = height
         self.simulator = simulator
         self.format = format
+    }
+
+    public init(base64: String, width: Int, height: Int, simulator: String, format: String = "jpeg") {
+        self.path = nil
+        self.base64 = base64
+        self.width = width
+        self.height = height
+        self.simulator = simulator
+        self.format = format
+    }
+}
+
+/// Result for compound interact command - returns screenshot after action
+public struct InteractResult: Encodable {
+    public let action: String
+    public let success: Bool
+    public let screenshot: ScreenshotResult?
+    public let element: String?
+
+    public init(action: String, success: Bool, screenshot: ScreenshotResult? = nil, element: String? = nil) {
+        self.action = action
+        self.success = success
+        self.screenshot = screenshot
+        self.element = element
     }
 }
 
