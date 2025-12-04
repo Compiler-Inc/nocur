@@ -255,16 +255,17 @@ pub fn capture_frame(window_id: u32) -> Result<FrameData, String> {
         let cg_image = core_graphics::image::CGImage::from_ptr(image_ref);
         context.draw_image(draw_rect, &cg_image);
 
-        // Convert RGBA to PNG
+        // Convert RGBA to RGB for JPEG (JPEG doesn't support alpha)
         let img = image::RgbaImage::from_raw(width, height, pixel_data)
             .ok_or("Failed to create image buffer")?;
+        let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
 
-        // Encode to PNG
+        // Encode to JPEG (much faster than PNG)
         let mut buffer = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut buffer);
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, 75);
         encoder
-            .write_image(&img, width, height, image::ExtendedColorType::Rgba8)
-            .map_err(|e| format!("PNG encode error: {}", e))?;
+            .encode(&rgb_img, width, height, image::ExtendedColorType::Rgb8)
+            .map_err(|e| format!("JPEG encode error: {}", e))?;
 
         // Encode as base64
         let base64_data = BASE64.encode(&buffer);
@@ -275,7 +276,7 @@ pub fn capture_frame(window_id: u32) -> Result<FrameData, String> {
             .as_millis() as u64;
 
         Ok(FrameData {
-            image: format!("data:image/png;base64,{}", base64_data),
+            image: format!("data:image/jpeg;base64,{}", base64_data),
             width,
             height,
             timestamp,

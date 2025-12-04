@@ -148,30 +148,20 @@ public final class UIInteractor {
                 simulatorUDID: udid,
                 tapCount: 1
             )
-            try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            try await Task.sleep(nanoseconds: 200_000_000) // 200ms to let keyboard appear
         }
 
         // Clear existing text if requested
         if clearFirst {
-            // Use simctl keysequence - much simpler than idb
-            _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", "cmd-a", "delete")
-            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
+            // Use idb key events: select all (Cmd+A) then delete
+            _ = try await shell("idb", "ui", "key", "--udid", udid, "4", "--modifier", "command")  // Cmd+A
+            try await Task.sleep(nanoseconds: 100_000_000)
+            _ = try await shell("idb", "ui", "key", "--udid", udid, "42")  // Backspace
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
 
-        // Type text using simctl - faster and more reliable than idb
-        // simctl io send-keys is actually called "keysequence"
-        // We need to escape special characters and use the text input
-        for char in text {
-            if char == " " {
-                _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", "space")
-            } else if char == "\n" {
-                _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", "return")
-            } else if char == "@" {
-                _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", "shift-2")
-            } else {
-                _ = try await shell("xcrun", "simctl", "io", udid, "keysequence", String(char))
-            }
-        }
+        // Type text using idb - requires idb to be connected
+        _ = try await shell("idb", "ui", "text", "--udid", udid, text)
 
         return TypeResult(text: text, element: elementIdentifier, cleared: clearFirst)
     }
