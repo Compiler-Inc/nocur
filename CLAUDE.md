@@ -183,20 +183,81 @@ struct Output<T: Encodable>: Encodable {
 
 ### Layout
 
-Three-pane layout:
-1. **Left: Project** - File tree, build status, errors
-2. **Center: Simulator** - Live mirror, screenshot history, hierarchy overlay
-3. **Right: Agent** - Claude terminal, task progress, what agent "sees"
+Three-pane resizable layout:
+1. **Left: Project** - File tree, build status, errors (resizable, 180-400px)
+2. **Center: Agent** - Claude chat interface, main focus area (flex, min 400px)
+3. **Right: Simulator** - Live iOS mirror, screenshot, hierarchy (resizable, 280-500px)
 
-Panes should be resizable. Collapse to focus.
+All panes are horizontally resizable via drag handles.
 
-### Colors
+### Color System
 
-Use shadcn/ui default dark theme as base. Key semantic colors:
-- Success: Green (build passed, task complete)
-- Error: Red (build failed, crash)
-- Warning: Yellow (deprecation, slow operation)
-- Agent action: Blue/Purple (agent is doing something)
+**IMPORTANT: Always use semantic color classes. Never use raw hex colors or zinc-* classes directly.**
+
+All colors are defined in `src/styles/globals.css` using the `@theme` directive. Use these Tailwind classes everywhere:
+
+#### Surface Colors (Backgrounds)
+| Class | Use For |
+|-------|---------|
+| `bg-surface-base` | Main app background |
+| `bg-surface-raised` | Cards, panels, sidebars |
+| `bg-surface-overlay` | Dropdowns, modals, buttons |
+| `bg-surface-sunken` | Inset areas |
+
+#### Text Colors
+| Class | Use For |
+|-------|---------|
+| `text-text-primary` | Primary text, headings |
+| `text-text-secondary` | Secondary/muted text |
+| `text-text-tertiary` | Placeholders, hints, labels |
+
+#### Border Colors
+| Class | Use For |
+|-------|---------|
+| `border-border` | Default borders |
+| `border-border-subtle` | Subtle dividers |
+| `border-border-strong` | Emphasized borders |
+
+#### Accent Colors (Amber - Claude's brand)
+| Class | Use For |
+|-------|---------|
+| `text-accent` / `bg-accent` | Primary accent, highlights |
+| `text-accent-muted` / `bg-accent-muted` | Muted accent |
+| `bg-accent-subtle` | Subtle accent backgrounds |
+
+#### Status Colors
+| Class | Use For |
+|-------|---------|
+| `text-success` / `bg-success` | Success states (build passed) |
+| `text-warning` / `bg-warning` | Warnings (building, slow) |
+| `text-error` / `bg-error` | Errors (build failed, crash) |
+| `bg-success-muted` / `bg-warning-muted` / `bg-error-muted` | Muted status backgrounds |
+
+#### Interactive States
+| Class | Use For |
+|-------|---------|
+| `hover:bg-hover` | Hover state on buttons/items |
+| `active:bg-active` | Active/pressed state |
+| `ring-focus-ring` | Focus ring |
+
+#### Example Usage
+```tsx
+// Good - semantic colors
+<div className="bg-surface-base text-text-primary">
+  <button className="bg-surface-overlay hover:bg-hover text-text-secondary">
+    Click me
+  </button>
+  <span className="text-accent">Highlighted</span>
+  <div className="border border-border bg-surface-raised">Card</div>
+</div>
+
+// Bad - raw colors (NEVER DO THIS)
+<div className="bg-zinc-950 text-zinc-100">
+  <button className="bg-zinc-800 hover:bg-zinc-700 text-zinc-400">
+    Click me
+  </button>
+</div>
+```
 
 ### Typography
 

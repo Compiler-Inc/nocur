@@ -1,96 +1,135 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 type SimulatorState = "disconnected" | "booting" | "running";
 
 export const SimulatorPane = () => {
-  const [state] = useState<SimulatorState>("running");
-  const [screenshot] = useState<string | null>("/tmp/nocur-test-screenshot.png"); // Mock for now
+  const [state, setState] = useState<SimulatorState>("running");
+  const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [showHierarchy, setShowHierarchy] = useState(false);
+  const [hierarchy, setHierarchy] = useState<string | null>(null);
+
+  const captureScreenshot = async () => {
+    setIsCapturing(true);
+    try {
+      // Returns a data:image/png;base64,... URL
+      const dataUrl = await invoke<string>("take_screenshot");
+      setScreenshotUrl(dataUrl);
+      setState("running");
+    } catch (error) {
+      console.error("Screenshot failed:", error);
+      setState("disconnected");
+    } finally {
+      setIsCapturing(false);
+    }
+  };
+
+  const fetchHierarchy = async () => {
+    try {
+      const result = await invoke<string>("get_view_hierarchy");
+      setHierarchy(result);
+      setShowHierarchy(true);
+    } catch (error) {
+      console.error("Hierarchy failed:", error);
+      setHierarchy(JSON.stringify({ error: String(error) }, null, 2));
+      setShowHierarchy(true);
+    }
+  };
+
+  // Auto-capture on mount
+  useEffect(() => {
+    captureScreenshot();
+  }, []);
 
   const stateConfig = {
-    disconnected: { color: "bg-zinc-500", text: "No Simulator" },
-    booting: { color: "bg-yellow-500 animate-pulse", text: "Booting..." },
-    running: { color: "bg-green-500", text: "Running" },
+    disconnected: { color: "bg-text-tertiary", text: "No Simulator" },
+    booting: { color: "bg-warning animate-pulse", text: "Booting..." },
+    running: { color: "bg-success", text: "Running" },
   };
 
   return (
-    <div className="flex flex-col h-full bg-zinc-950">
+    <div className="flex flex-col h-full bg-surface-base relative">
       {/* Header */}
-      <div className="h-12 px-4 flex items-center justify-between border-b border-zinc-800 bg-zinc-900/50">
+      <div className="h-12 px-4 flex items-center justify-between border-b border-border bg-surface-raised/50">
         <div className="flex items-center gap-3">
-          <h2 className="text-sm font-medium text-zinc-300">Simulator</h2>
+          <h2 className="text-sm font-medium text-text-primary">Simulator</h2>
           <div className="flex items-center gap-2">
             <div className={`h-2 w-2 rounded-full ${stateConfig[state].color}`} />
-            <span className="text-xs text-zinc-500">{stateConfig[state].text}</span>
+            <span className="text-xs text-text-tertiary">{stateConfig[state].text}</span>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button className="px-2 py-1 text-xs rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors">
-            Screenshot
+          <button
+            onClick={captureScreenshot}
+            disabled={isCapturing}
+            className="px-2 py-1 text-xs rounded bg-surface-overlay hover:bg-hover text-text-secondary hover:text-text-primary transition-colors disabled:opacity-50"
+          >
+            {isCapturing ? "..." : "Refresh"}
           </button>
-          <button className="px-2 py-1 text-xs rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors">
+          <button
+            onClick={fetchHierarchy}
+            className="px-2 py-1 text-xs rounded bg-surface-overlay hover:bg-hover text-text-secondary hover:text-text-primary transition-colors"
+          >
             Hierarchy
           </button>
         </div>
       </div>
 
       {/* Simulator View */}
-      <div className="flex-1 flex items-center justify-center p-4 bg-zinc-900/30">
+      <div className="flex-1 flex items-center justify-center p-4 bg-surface-raised/30 overflow-hidden">
         {state === "disconnected" ? (
           <div className="text-center space-y-4">
-            <div className="w-48 h-96 rounded-3xl border-2 border-dashed border-zinc-700 flex items-center justify-center">
+            <div className="w-48 h-96 rounded-3xl border-2 border-dashed border-border flex items-center justify-center">
               <div className="text-center space-y-2 p-4">
-                <div className="text-3xl text-zinc-700">◎</div>
-                <p className="text-xs text-zinc-600">No simulator</p>
+                <div className="text-3xl text-border">◎</div>
+                <p className="text-xs text-text-tertiary">No simulator</p>
               </div>
             </div>
-            <button className="px-4 py-2 text-xs rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors">
+            <button className="px-4 py-2 text-xs rounded bg-surface-overlay hover:bg-hover text-text-primary transition-colors">
               Boot Simulator
             </button>
           </div>
         ) : (
-          <div className="relative">
-            {/* Device frame */}
-            <div className="relative rounded-[2.5rem] border-4 border-zinc-800 bg-black overflow-hidden shadow-2xl">
-              {/* Notch */}
-              <div className="absolute top-0 left-1/2 -translate-x-1/2 w-28 h-7 bg-black rounded-b-2xl z-10" />
-
-              {/* Screen content */}
-              <div className="w-[280px] h-[606px] bg-zinc-900">
-                {screenshot ? (
-                  <div className="w-full h-full flex items-center justify-center text-zinc-600">
-                    {/* In real implementation, this would show the actual screenshot */}
-                    <div className="text-center space-y-2">
-                      <div className="text-2xl">📱</div>
-                      <p className="text-xs">Live view</p>
-                      <p className="text-[10px] text-zinc-700">Click to refresh</p>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <span className="text-zinc-600 text-xs">Loading...</span>
-                  </div>
-                )}
+          <div
+            className="cursor-pointer h-full flex items-center justify-center"
+            onClick={captureScreenshot}
+          >
+            {screenshotUrl ? (
+              <img
+                src={screenshotUrl}
+                alt="Simulator screenshot"
+                className="h-full max-h-[calc(100%-2rem)] w-auto object-contain rounded-[1.5rem] shadow-xl"
+              />
+            ) : isCapturing ? (
+              <div className="w-64 h-[500px] rounded-[2rem] bg-surface-raised flex items-center justify-center">
+                <div className="text-center space-y-2">
+                  <div className="w-5 h-5 border-2 border-border border-t-accent rounded-full animate-spin mx-auto" />
+                  <p className="text-xs text-text-tertiary">Capturing...</p>
+                </div>
               </div>
-            </div>
-
-            {/* Device name */}
-            <div className="mt-3 text-center">
-              <span className="text-xs text-zinc-500 font-mono">iPhone 16 Pro</span>
-            </div>
+            ) : (
+              <div className="w-64 h-[500px] rounded-[2rem] bg-surface-raised border-2 border-dashed border-border flex items-center justify-center">
+                <div className="text-center space-y-2">
+                  <div className="text-2xl text-border">◎</div>
+                  <p className="text-xs text-text-tertiary">Click to capture</p>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
 
       {/* Bottom toolbar */}
-      <div className="h-12 px-4 flex items-center justify-between border-t border-zinc-800 bg-zinc-900/50">
+      <div className="h-12 px-4 flex items-center justify-between border-t border-border bg-surface-raised/50">
         <div className="flex items-center gap-2">
-          <span className="text-xs text-zinc-600 font-mono">iOS 18.2</span>
-          <span className="text-zinc-700">•</span>
-          <span className="text-xs text-zinc-600 font-mono">1206×2622</span>
+          <span className="text-xs text-text-tertiary font-mono">iOS 18.2</span>
+          <span className="text-border">•</span>
+          <span className="text-xs text-text-tertiary font-mono">1206×2622</span>
         </div>
         <div className="flex items-center gap-1">
           <button
-            className="p-2 rounded hover:bg-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors"
+            className="p-2 rounded hover:bg-hover text-text-tertiary hover:text-text-primary transition-colors"
             title="Tap"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -99,7 +138,7 @@ export const SimulatorPane = () => {
             </svg>
           </button>
           <button
-            className="p-2 rounded hover:bg-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors"
+            className="p-2 rounded hover:bg-hover text-text-tertiary hover:text-text-primary transition-colors"
             title="Scroll"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -107,7 +146,7 @@ export const SimulatorPane = () => {
             </svg>
           </button>
           <button
-            className="p-2 rounded hover:bg-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors"
+            className="p-2 rounded hover:bg-hover text-text-tertiary hover:text-text-primary transition-colors"
             title="Type"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -115,9 +154,9 @@ export const SimulatorPane = () => {
               <path strokeWidth="2" d="M6 14h.01M10 14h.01M14 14h.01M18 14h.01M8 10h8"/>
             </svg>
           </button>
-          <div className="w-px h-4 bg-zinc-800 mx-1"/>
+          <div className="w-px h-4 bg-border mx-1"/>
           <button
-            className="p-2 rounded hover:bg-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors"
+            className="p-2 rounded hover:bg-hover text-text-tertiary hover:text-text-primary transition-colors"
             title="Home"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -127,6 +166,26 @@ export const SimulatorPane = () => {
           </button>
         </div>
       </div>
+
+      {/* Hierarchy Panel */}
+      {showHierarchy && (
+        <div className="absolute inset-0 bg-surface-base/95 z-20 flex flex-col">
+          <div className="h-12 px-4 flex items-center justify-between border-b border-border bg-surface-raised/50">
+            <h2 className="text-sm font-medium text-text-primary">View Hierarchy</h2>
+            <button
+              onClick={() => setShowHierarchy(false)}
+              className="px-2 py-1 text-xs rounded bg-surface-overlay hover:bg-hover text-text-secondary hover:text-text-primary transition-colors"
+            >
+              Close
+            </button>
+          </div>
+          <div className="flex-1 overflow-auto p-4">
+            <pre className="text-xs text-text-secondary font-mono whitespace-pre-wrap">
+              {hierarchy || "Loading..."}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -1,38 +1,70 @@
 @import "tailwindcss";
 
 @theme {
-  /* Dark theme colors - shadcn/ui compatible */
-  --color-background: oklch(0.145 0 0);
-  --color-foreground: oklch(0.985 0 0);
-  --color-card: oklch(0.145 0 0);
-  --color-card-foreground: oklch(0.985 0 0);
-  --color-popover: oklch(0.145 0 0);
-  --color-popover-foreground: oklch(0.985 0 0);
-  --color-primary: oklch(0.985 0 0);
-  --color-primary-foreground: oklch(0.205 0 0);
-  --color-secondary: oklch(0.269 0 0);
-  --color-secondary-foreground: oklch(0.985 0 0);
-  --color-muted: oklch(0.269 0 0);
-  --color-muted-foreground: oklch(0.708 0 0);
-  --color-accent: oklch(0.269 0 0);
-  --color-accent-foreground: oklch(0.985 0 0);
-  --color-destructive: oklch(0.396 0.141 25.723);
-  --color-destructive-foreground: oklch(0.985 0 0);
-  --color-border: oklch(0.269 0 0);
-  --color-input: oklch(0.269 0 0);
-  --color-ring: oklch(0.556 0 0);
+  /* ===========================================
+     NOCUR COLOR SYSTEM
+     Use these semantic colors EVERYWHERE.
+     Never use custom hex colors like bg-[#1a1915]
+     =========================================== */
+
+  /* Base surfaces - use these for backgrounds */
+  --color-surface-base: oklch(0.12 0.01 60);      /* Main app background */
+  --color-surface-raised: oklch(0.15 0.01 60);    /* Cards, panels */
+  --color-surface-overlay: oklch(0.18 0.01 60);   /* Dropdowns, modals */
+  --color-surface-sunken: oklch(0.10 0.01 60);    /* Inset areas */
+
+  /* Borders */
+  --color-border: oklch(0.25 0.01 60);            /* Default borders */
+  --color-border-subtle: oklch(0.20 0.01 60);     /* Subtle dividers */
+  --color-border-strong: oklch(0.35 0.01 60);     /* Emphasized borders */
+
+  /* Text */
+  --color-text-primary: oklch(0.93 0 0);          /* Primary text */
+  --color-text-secondary: oklch(0.65 0 0);        /* Secondary/muted text */
+  --color-text-tertiary: oklch(0.45 0 0);         /* Placeholder, hints */
+
+  /* Brand / Accent - Amber tones (Claude's color) */
+  --color-accent: oklch(0.75 0.15 65);            /* Primary accent */
+  --color-accent-muted: oklch(0.55 0.10 65);      /* Muted accent */
+  --color-accent-subtle: oklch(0.25 0.05 65);     /* Subtle accent bg */
 
   /* Status colors */
-  --color-success: oklch(0.696 0.17 162.48);
-  --color-warning: oklch(0.769 0.188 70.08);
-  --color-error: oklch(0.577 0.245 27.325);
-  --color-info: oklch(0.623 0.214 259.815);
+  --color-success: oklch(0.70 0.17 162);          /* Success green */
+  --color-success-muted: oklch(0.35 0.08 162);    /* Muted success */
+  --color-warning: oklch(0.77 0.19 70);           /* Warning yellow */
+  --color-warning-muted: oklch(0.35 0.08 70);     /* Muted warning */
+  --color-error: oklch(0.60 0.20 25);             /* Error red */
+  --color-error-muted: oklch(0.30 0.10 25);       /* Muted error */
+
+  /* Interactive states */
+  --color-hover: oklch(0.22 0.01 60);             /* Hover background */
+  --color-active: oklch(0.28 0.01 60);            /* Active/pressed */
+  --color-focus-ring: oklch(0.55 0.12 65);        /* Focus ring */
+
+  /* Legacy shadcn compatibility */
+  --color-background: var(--color-surface-base);
+  --color-foreground: var(--color-text-primary);
+  --color-card: var(--color-surface-raised);
+  --color-card-foreground: var(--color-text-primary);
+  --color-popover: var(--color-surface-overlay);
+  --color-popover-foreground: var(--color-text-primary);
+  --color-primary: var(--color-accent);
+  --color-primary-foreground: oklch(0.15 0 0);
+  --color-secondary: var(--color-surface-raised);
+  --color-secondary-foreground: var(--color-text-primary);
+  --color-muted: var(--color-surface-raised);
+  --color-muted-foreground: var(--color-text-secondary);
+  --color-destructive: var(--color-error);
+  --color-destructive-foreground: var(--color-text-primary);
+  --color-input: var(--color-surface-raised);
+  --color-ring: var(--color-focus-ring);
 
   /* Radius */
   --radius-sm: 0.25rem;
-  --radius-md: 0.375rem;
-  --radius-lg: 0.5rem;
-  --radius-xl: 0.75rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-full: 9999px;
 
   /* Fonts */
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
@@ -46,11 +78,11 @@
   }
 
   body {
-    @apply bg-background text-foreground font-sans antialiased;
+    @apply bg-surface-base text-text-primary font-sans antialiased;
     font-feature-settings: "rlig" 1, "calt" 1;
   }
 
-  /* Custom scrollbar for dark theme */
+  /* Custom scrollbar */
   ::-webkit-scrollbar {
     width: 8px;
     height: 8px;
@@ -61,11 +93,20 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    background: oklch(0.35 0 0);
-    border-radius: 4px;
+    @apply bg-border rounded;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    background: oklch(0.45 0 0);
+    @apply bg-border-strong;
   }
+}
+
+/* Animations */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.3s ease-out;
 }
