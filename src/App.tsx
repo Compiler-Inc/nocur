@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { SimulatorPane } from "@/components/panes/SimulatorPane";
 import { AgentPane } from "@/components/panes/AgentPane";
 import { DevToolsPane } from "@/components/panes/DevToolsPane";
@@ -122,7 +123,7 @@ const App = () => {
 
   // Pane widths - balanced like Conductor
   const [leftWidth, setLeftWidth] = useState(300);
-  const [rightWidth, setRightWidth] = useState(280);
+  const [rightWidth, setRightWidth] = useState(320);
 
   // Session state (shared with sidebar)
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -238,7 +239,7 @@ const App = () => {
   }, []);
 
   const handleRightResize = useCallback((delta: number) => {
-    setRightWidth((w) => Math.max(240, Math.min(360, w + delta)));
+    setRightWidth((w) => Math.max(280, Math.min(400, w + delta)));
   }, []);
 
   // Session action handlers for sidebar
@@ -399,6 +400,17 @@ const App = () => {
     }
   };
 
+  // Handle window dragging programmatically
+  const handleTitleBarMouseDown = (e: React.MouseEvent) => {
+    // Don't drag if clicking on a button or interactive element
+    const target = e.target as HTMLElement;
+    if (target.closest('button') || target.closest('[data-no-drag]')) {
+      return;
+    }
+    e.preventDefault();
+    getCurrentWindow().startDragging();
+  };
+
   // Show loading
   if (isReady === null) {
     return (
@@ -420,11 +432,11 @@ const App = () => {
     <div className="flex flex-col h-screen w-screen bg-surface-base text-text-primary animate-fade-in overflow-hidden">
       {/* Unified Top Bar - draggable with space for macOS traffic lights */}
       <div
-        data-tauri-drag-region
-        className="h-12 flex items-center justify-between pl-[78px] pr-4 bg-surface-raised border-b border-border shrink-0"
+        onMouseDown={handleTitleBarMouseDown}
+        className="h-12 flex items-center justify-between pl-[78px] pr-4 bg-surface-raised border-b border-border shrink-0 cursor-default"
       >
         {/* Left: Logo and project */}
-        <div className="flex items-center gap-3" data-tauri-drag-region>
+        <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
             <span className="text-accent text-lg">◎</span>
             <span className="text-sm font-semibold text-text-primary">Nocur</span>
@@ -447,7 +459,7 @@ const App = () => {
         </div>
 
         {/* Center: spacer for drag region */}
-        <div className="flex-1" data-tauri-drag-region />
+        <div className="flex-1 min-h-full" />
 
         {/* Right: Build controls and settings */}
         <div className="flex items-center gap-3">
@@ -523,7 +535,90 @@ const App = () => {
             style={{ width: rightWidth }}
             className="flex flex-col shrink-0 overflow-hidden bg-surface-raised"
           >
-            <SimulatorPane />
+            <SimulatorPane
+              isAppRunning={buildStatus === "success"}
+              onCapture={async (data) => {
+                console.log(`Recording captured:`, {
+                  frames: data.frames.length,
+                  logs: data.logs.length,
+                  crashes: data.crashes.length,
+                  duration: `${Math.round((data.endTime - data.startTime) / 1000)}s`
+                });
+
+                // Save key screenshots to temp files so Claude can view them
+                // Sample ~5 frames evenly distributed across the recording
+                const maxFramesToSend = 5;
+                const step = Math.max(1, Math.floor(data.frames.length / maxFramesToSend));
+                const selectedFrames = data.frames
+                  .filter((_, i) => i % step === 0)
+                  .slice(0, maxFramesToSend);
+
+                let screenshotPaths: string[] = [];
+                if (selectedFrames.length > 0) {
+                  try {
+                    screenshotPaths = await invoke<string[]>("save_screenshots_to_temp", {
+                      images: selectedFrames.map(f => f.image),
+                      prefix: null
+                    });
+                    console.log(`Saved ${screenshotPaths.length} screenshots to temp files`);
+                  } catch (e) {
+                    console.error("Failed to save screenshots:", e);
+                  }
+                }
+
+                // Build a message with the recording context
+                const duration = Math.round((data.endTime - data.startTime) / 1000);
+                const errorLogs = data.logs.filter(l => l.level === "error" || l.level === "fault");
+
+                let message = `I recorded the iOS simulator for ${duration}s (${data.frames.length} frames total).\n\n`;
+
+                // Add screenshot paths for Claude to view
+                if (screenshotPaths.length > 0) {
+                  message += `Here are ${screenshotPaths.length} screenshots from the recording. Please read these image files to see the app state:\n`;
+                  screenshotPaths.forEach((path, i) => {
+                    message += `- Frame ${i + 1}: ${path}\n`;
+                  });
+                  message += "\n";
+                }
+
+                // Add error summary if any
+                if (errorLogs.length > 0) {
+                  message += `${errorLogs.length} errors detected in logs:\n`;
+                  errorLogs.slice(0, 5).forEach(log => {
+                    message += `- [${log.process}] ${log.message.slice(0, 200)}\n`;
+                  });
+                  if (errorLogs.length > 5) {
+                    message += `... and ${errorLogs.length - 5} more errors\n`;
+                  }
+                  message += "\n";
+                }
+
+                // Add crash info if any
+                if (data.crashes.length > 0) {
+                  message += `${data.crashes.length} crash(es) detected:\n`;
+                  data.crashes.forEach(crash => {
+                    message += `- ${crash.processName}: ${crash.exceptionType || "Unknown"}\n`;
+                    if (crash.crashReason) {
+                      message += `  Reason: ${crash.crashReason}\n`;
+                    }
+                    if (crash.stackTrace) {
+                      message += `  Stack trace (first 500 chars): ${crash.stackTrace.slice(0, 500)}\n`;
+                    }
+                  });
+                  message += "\n";
+                }
+
+                message += "Please analyze ONLY what you can see in these screenshots. Do not assume features are broken just because they weren't demonstrated - focus on what IS visible and any actual errors in the logs.";
+
+                // Send to Claude
+                try {
+                  await invoke("send_claude_message", { message });
+                  console.log("Recording sent to Claude");
+                } catch (e) {
+                  console.error("Failed to send recording to Claude:", e);
+                }
+              }}
+            />
           </div>
 
           {/* Dev Tools Pane - Version Control + Terminal */}

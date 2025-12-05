@@ -81,7 +81,7 @@ export const HistorySidebar = ({
   const [showHistory, setShowHistory] = useState(false);
   const [claudeSessions, setClaudeSessions] = useState<ClaudeCodeSession[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
-  const [sessionNames, setSessionNames] = useState<Record<string, string>>({});
+  const [_sessionNames, _setSessionNames] = useState<Record<string, string>>({});
   const [currentSessionName, setCurrentSessionName] = useState<string | null>(null);
 
   // Load git worktrees
@@ -161,7 +161,7 @@ export const HistorySidebar = ({
       const loadNames = async () => {
         try {
           const names = await invoke<Record<string, string>>("get_session_names");
-          setSessionNames(names);
+          _setSessionNames(names);
         } catch (err) {
           console.error("Failed to load session names:", err);
         }

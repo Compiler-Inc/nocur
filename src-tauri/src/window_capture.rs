@@ -321,6 +321,73 @@ pub fn send_mouse_click(x: f64, y: f64, bounds: &WindowBounds) -> Result<(), Str
     Ok(())
 }
 
+/// Send a mouse drag (swipe) to the simulator window
+pub fn send_mouse_drag(
+    start_x: f64,
+    start_y: f64,
+    end_x: f64,
+    end_y: f64,
+    duration_ms: u64,
+    bounds: &WindowBounds,
+) -> Result<(), String> {
+    // Convert relative coordinates (0-1) to absolute screen coordinates
+    let abs_start_x = bounds.x + (start_x * bounds.width);
+    let abs_start_y = bounds.y + (start_y * bounds.height);
+    let abs_end_x = bounds.x + (end_x * bounds.width);
+    let abs_end_y = bounds.y + (end_y * bounds.height);
+
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| "Failed to create event source")?;
+
+    let start_point = CGPoint::new(abs_start_x, abs_start_y);
+    let end_point = CGPoint::new(abs_end_x, abs_end_y);
+
+    // Number of intermediate steps for smooth drag
+    let steps = 20;
+    let step_delay = std::time::Duration::from_millis(duration_ms / steps);
+
+    // Mouse down at start
+    let mouse_down = CGEvent::new_mouse_event(
+        source.clone(),
+        CGEventType::LeftMouseDown,
+        start_point,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| "Failed to create mouse down event")?;
+    mouse_down.post(CGEventTapLocation::HID);
+
+    // Drag through intermediate points
+    for i in 1..=steps {
+        let progress = i as f64 / steps as f64;
+        let current_x = abs_start_x + (abs_end_x - abs_start_x) * progress;
+        let current_y = abs_start_y + (abs_end_y - abs_start_y) * progress;
+        let current_point = CGPoint::new(current_x, current_y);
+
+        let drag = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::LeftMouseDragged,
+            current_point,
+            CGMouseButton::Left,
+        )
+        .map_err(|_| "Failed to create drag event")?;
+        drag.post(CGEventTapLocation::HID);
+
+        std::thread::sleep(step_delay);
+    }
+
+    // Mouse up at end
+    let mouse_up = CGEvent::new_mouse_event(
+        source,
+        CGEventType::LeftMouseUp,
+        end_point,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| "Failed to create mouse up event")?;
+    mouse_up.post(CGEventTapLocation::HID);
+
+    Ok(())
+}
+
 /// Start streaming frames to the frontend
 pub async fn start_streaming(
     app_handle: AppHandle,

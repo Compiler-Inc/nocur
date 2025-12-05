@@ -14,6 +14,8 @@ struct Sim: AsyncParsableCommand {
             Boot.self,
             Shutdown.self,
             Screenshot.self,
+            Observe.self,
+            Diff.self,
             Status.self
         ],
         defaultSubcommand: List.self
@@ -166,6 +168,111 @@ extension Sim {
                 outputPath: output,
                 base64Output: base64,
                 useJpeg: jpeg
+            )
+            print(Output.success(result).json)
+        }
+    }
+}
+
+// MARK: - Observe
+
+extension Sim {
+    struct Observe: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Observe simulator over time (screenshot sequence)",
+            discussion: """
+                Captures multiple screenshots over a duration to understand app behavior.
+                This is a workaround for video recording when the agent doesn't support video.
+
+                Useful for:
+                - Understanding animations
+                - Verifying transitions
+                - Observing loading states
+                - Debugging timing issues
+
+                Example:
+                  nocur-swift sim observe --duration 2 --frames 5
+
+                Output:
+                {
+                  "success": true,
+                  "data": {
+                    "frames": [
+                      { "timestamp": 0.0, "image": "data:image/jpeg;base64,..." },
+                      { "timestamp": 0.5, "image": "data:image/jpeg;base64,..." },
+                      ...
+                    ],
+                    "duration": 2.0,
+                    "frameCount": 5,
+                    "simulator": "iPhone 16 Pro"
+                  }
+                }
+                """
+        )
+
+        @Argument(help: "Simulator UDID (uses booted if omitted)")
+        var udid: String?
+
+        @Option(name: .shortAndLong, help: "Duration in seconds (max 5)")
+        var duration: Double = 2.0
+
+        @Option(name: .shortAndLong, help: "Number of frames to capture (2-10)")
+        var frames: Int = 5
+
+        func run() async throws {
+            let controller = SimulatorController()
+            let result = try await controller.observe(
+                udid: udid,
+                duration: duration,
+                frames: frames
+            )
+            print(Output.success(result).json)
+        }
+    }
+}
+
+// MARK: - Diff
+
+extension Sim {
+    struct Diff: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Compare current screen to a reference screenshot",
+            discussion: """
+                Compares the current simulator screen to a reference image.
+                Useful for verifying that UI changes have been applied correctly.
+
+                Example:
+                  nocur-swift sim diff /path/to/reference.png
+
+                Output:
+                {
+                  "success": true,
+                  "data": {
+                    "changesDetected": true,
+                    "changePercentage": 15.5,
+                    "changedRegions": [...],
+                    "summary": "Moderate changes detected: 15% of screen changed",
+                    "currentScreenshot": "data:image/jpeg;base64,..."
+                  }
+                }
+                """
+        )
+
+        @Argument(help: "Path to reference screenshot to compare against")
+        var reference: String
+
+        @Argument(help: "Simulator UDID (uses booted if omitted)")
+        var udid: String?
+
+        @Option(name: .shortAndLong, help: "Minimum change percentage to report (default: 5)")
+        var threshold: Double = 5.0
+
+        func run() async throws {
+            let controller = SimulatorController()
+            let result = try await controller.diff(
+                udid: udid,
+                referencePath: reference,
+                threshold: threshold
             )
             print(Output.success(result).json)
         }

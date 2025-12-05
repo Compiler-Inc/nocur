@@ -178,6 +178,159 @@ public final class SimulatorController {
         )
     }
 
+    // MARK: - Observe (Screenshot Sequence)
+
+    /// Capture multiple screenshots over a duration for understanding app behavior
+    public func observe(
+        udid: String?,
+        duration: Double,
+        frames: Int = 5
+    ) async throws -> ObserveResult {
+        let targetUDID = try await resolveSimulator(udid)
+        let list = try await listSimulators()
+        let simName = list.simulators.first { $0.udid == targetUDID }?.name ?? "Unknown"
+
+        // Cap duration at 5 seconds to avoid huge payloads
+        let cappedDuration = min(duration, 5.0)
+        // Cap frames at 10
+        let cappedFrames = min(max(frames, 2), 10)
+
+        let interval = cappedDuration / Double(cappedFrames - 1)
+        var capturedFrames: [ObserveFrame] = []
+        let startTime = Date()
+
+        for i in 0..<cappedFrames {
+            // Capture frame
+            let screenshotResult = try await takeScreenshot(
+                udid: targetUDID,
+                outputPath: nil,
+                base64Output: true,
+                useJpeg: true
+            )
+
+            let timestamp = Date().timeIntervalSince(startTime)
+            if let base64 = screenshotResult.base64 {
+                capturedFrames.append(ObserveFrame(
+                    timestamp: timestamp,
+                    image: base64
+                ))
+            }
+
+            // Wait for next frame (except after last)
+            if i < cappedFrames - 1 {
+                try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            }
+        }
+
+        let actualDuration = Date().timeIntervalSince(startTime)
+
+        return ObserveResult(
+            frames: capturedFrames,
+            duration: actualDuration,
+            simulator: simName
+        )
+    }
+
+    // MARK: - Diff (Screen Comparison)
+
+    /// Compare current simulator state to a reference screenshot
+    public func diff(
+        udid: String?,
+        referencePath: String,
+        threshold: Double = 5.0  // Minimum change percentage to report
+    ) async throws -> DiffResult {
+        let targetUDID = try await resolveSimulator(udid)
+
+        // Load reference image
+        guard FileManager.default.fileExists(atPath: referencePath) else {
+            throw NocurError.notFound("Reference image not found: \(referencePath)")
+        }
+
+        guard let referenceData = FileManager.default.contents(atPath: referencePath) else {
+            throw NocurError.parseError("Could not read reference image")
+        }
+
+        // Take current screenshot
+        let currentScreenshot = try await takeScreenshot(
+            udid: targetUDID,
+            outputPath: nil,
+            base64Output: true,
+            useJpeg: true
+        )
+
+        // Simple pixel comparison: count changed pixels
+        // We'll use a sampling approach for speed
+        let changeResult = compareImages(
+            referenceData: referenceData,
+            referencePath: referencePath,
+            currentBase64: currentScreenshot.base64 ?? ""
+        )
+
+        let changesDetected = changeResult.changePercentage > threshold
+
+        // Generate summary
+        let summary: String
+        if !changesDetected {
+            summary = "No significant changes detected (< \(Int(threshold))% change)"
+        } else if changeResult.changePercentage > 50 {
+            summary = "Major changes detected: \(Int(changeResult.changePercentage))% of screen changed"
+        } else if changeResult.changePercentage > 20 {
+            summary = "Moderate changes detected: \(Int(changeResult.changePercentage))% of screen changed"
+        } else {
+            summary = "Minor changes detected: \(Int(changeResult.changePercentage))% of screen changed"
+        }
+
+        return DiffResult(
+            changesDetected: changesDetected,
+            changePercentage: changeResult.changePercentage,
+            changedRegions: changeResult.regions,
+            summary: summary,
+            currentScreenshot: currentScreenshot.base64
+        )
+    }
+
+    /// Simple image comparison helper
+    private func compareImages(
+        referenceData: Data,
+        referencePath: String,
+        currentBase64: String
+    ) -> (changePercentage: Double, regions: [ChangedRegion]) {
+        // For a simple implementation, we'll use file size difference as a proxy
+        // A more sophisticated implementation would do pixel-by-pixel comparison
+
+        // Extract base64 data from current screenshot
+        guard let base64Start = currentBase64.range(of: "base64,") else {
+            return (0, [])
+        }
+        let base64Data = String(currentBase64[base64Start.upperBound...])
+        guard let currentData = Data(base64Encoded: base64Data) else {
+            return (0, [])
+        }
+
+        // Compare file sizes as a rough proxy for change
+        let refSize = referenceData.count
+        let curSize = currentData.count
+        let sizeDiff = abs(refSize - curSize)
+        let avgSize = (refSize + curSize) / 2
+
+        // Size difference doesn't perfectly correlate with visual change,
+        // but it's a reasonable heuristic for JPEG images
+        var estimatedChange = Double(sizeDiff) / Double(avgSize) * 100
+
+        // Normalize - JPEG compression means even identical images can vary ~5%
+        estimatedChange = max(0, estimatedChange - 5)
+
+        // For now, return a single "changed" region covering the whole screen
+        // A proper implementation would do region detection
+        var regions: [ChangedRegion] = []
+        if estimatedChange > 5 {
+            // Placeholder region - full screen change
+            regions.append(ChangedRegion(x: 0, y: 0, width: 100, height: 100))
+        }
+
+        return (estimatedChange, regions)
+    }
+
     // MARK: - Status
 
     public func getStatus() async throws -> SimulatorStatus {

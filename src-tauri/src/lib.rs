@@ -629,6 +629,11 @@ async fn send_claude_message(
     let claude_state = state.lock();
 
     if let Some(ref session) = claude_state.session {
+        // Emit user message event so the UI can display it
+        let _ = app_handle.emit("user-message", serde_json::json!({
+            "content": message
+        }));
+
         session.send_message(&message, app_handle)?;
         Ok(())
     } else {
@@ -2139,14 +2144,445 @@ async fn simulator_click(
 
 #[cfg(target_os = "macos")]
 #[tauri::command]
+async fn simulator_swipe(
+    start_x: f64,
+    start_y: f64,
+    end_x: f64,
+    end_y: f64,
+    duration_ms: Option<u64>,
+    state: State<'_, Arc<WindowCaptureState>>,
+) -> Result<(), String> {
+    let bounds = state.get_bounds().ok_or("No simulator window bounds")?;
+    let duration = duration_ms.unwrap_or(300);
+    window_capture::send_mouse_drag(start_x, start_y, end_x, end_y, duration, &bounds)
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn simulator_home() -> Result<(), String> {
+    // Use simctl to press home button
+    let output = Command::new("xcrun")
+        .args(["simctl", "io", "booted", "sendkey", "home"])
+        .output()
+        .map_err(|e| format!("Failed to press home: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Home button failed: {}", stderr));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn focus_simulator() -> Result<(), String> {
+    // Use AppleScript to bring Simulator to front
+    let output = Command::new("osascript")
+        .args(["-e", "tell application \"Simulator\" to activate"])
+        .output()
+        .map_err(|e| format!("Failed to focus simulator: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Focus simulator failed: {}", stderr));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
 async fn find_simulator_window() -> Result<window_capture::SimulatorWindowInfo, String> {
     window_capture::find_simulator_window()
+}
+
+// ============ Simulator Log Streaming ============
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
+
+/// State for simulator log streaming
+pub struct SimulatorLogState {
+    is_streaming: AtomicBool,
+    logs: RwLock<Vec<SimulatorLogEntry>>,
+    child_pid: RwLock<Option<u32>>,
+}
+
+impl SimulatorLogState {
+    pub fn new() -> Self {
+        Self {
+            is_streaming: AtomicBool::new(false),
+            logs: RwLock::new(Vec::new()),
+            child_pid: RwLock::new(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulatorLogEntry {
+    pub timestamp: u64,
+    pub level: String,      // "debug", "info", "warning", "error", "fault"
+    pub process: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogStreamEvent {
+    pub entries: Vec<SimulatorLogEntry>,
+}
+
+/// Start streaming simulator logs
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn start_simulator_logs(
+    bundle_id: Option<String>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, Arc<SimulatorLogState>>,
+) -> Result<(), String> {
+    if state.is_streaming.load(Ordering::SeqCst) {
+        return Ok(()); // Already streaming
+    }
+
+    state.is_streaming.store(true, Ordering::SeqCst);
+
+    // Clear existing logs
+    {
+        let mut logs = state.logs.write().unwrap();
+        logs.clear();
+    }
+
+    let state_clone = state.inner().clone();
+    let app_handle_clone = app_handle.clone();
+
+    // Spawn log streaming in background
+    std::thread::spawn(move || {
+        // Build the log stream command
+        let mut cmd = Command::new("xcrun");
+        cmd.args(["simctl", "spawn", "booted", "log", "stream", "--style", "compact"]);
+
+        // Filter by bundle ID if provided
+        if let Some(ref bid) = bundle_id {
+            cmd.args(["--predicate", &format!("subsystem == '{}' OR process == '{}'", bid, bid)]);
+        }
+
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("Failed to start log stream: {}", e);
+                state_clone.is_streaming.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        // Store child PID for later killing
+        let pid = child.id();
+        *state_clone.child_pid.write().unwrap() = Some(pid);
+
+        let stdout = child.stdout.take().expect("Failed to capture stdout");
+        let reader = BufReader::new(stdout);
+
+        for line in reader.lines() {
+            if !state_clone.is_streaming.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if let Ok(line) = line {
+                // Parse log line (format: "2024-01-01 12:00:00.000000 process[pid] <level> message")
+                let entry = parse_log_line(&line);
+
+                // Store in state
+                {
+                    let mut logs = state_clone.logs.write().unwrap();
+                    logs.push(entry.clone());
+                    // Keep only last 1000 entries
+                    if logs.len() > 1000 {
+                        logs.remove(0);
+                    }
+                }
+
+                // Emit event to frontend
+                let _ = app_handle_clone.emit("simulator-log", LogStreamEvent {
+                    entries: vec![entry],
+                });
+            }
+        }
+
+        // Cleanup
+        let _ = child.kill();
+        state_clone.is_streaming.store(false, Ordering::SeqCst);
+        *state_clone.child_pid.write().unwrap() = None;
+    });
+
+    Ok(())
+}
+
+fn parse_log_line(line: &str) -> SimulatorLogEntry {
+    // Simple parser for log lines
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Try to extract level from <level> markers
+    let level = if line.contains("<Error>") || line.contains("error") {
+        "error"
+    } else if line.contains("<Warning>") || line.contains("warning") {
+        "warning"
+    } else if line.contains("<Debug>") || line.contains("debug") {
+        "debug"
+    } else if line.contains("<Fault>") || line.contains("fault") {
+        "fault"
+    } else {
+        "info"
+    }.to_string();
+
+    // Try to extract process name
+    let process = line.split_whitespace()
+        .nth(2)
+        .and_then(|s| s.split('[').next())
+        .unwrap_or("unknown")
+        .to_string();
+
+    SimulatorLogEntry {
+        timestamp,
+        level,
+        process,
+        message: line.to_string(),
+    }
+}
+
+/// Stop streaming simulator logs
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn stop_simulator_logs(
+    state: State<'_, Arc<SimulatorLogState>>,
+) -> Result<(), String> {
+    state.is_streaming.store(false, Ordering::SeqCst);
+
+    // Kill the child process if running
+    if let Some(pid) = *state.child_pid.read().unwrap() {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
+    }
+
+    Ok(())
+}
+
+/// Get all captured logs so far
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn get_simulator_logs(
+    state: State<'_, Arc<SimulatorLogState>>,
+) -> Result<Vec<SimulatorLogEntry>, String> {
+    let logs = state.logs.read().unwrap();
+    Ok(logs.clone())
+}
+
+/// Clear captured logs
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn clear_simulator_logs(
+    state: State<'_, Arc<SimulatorLogState>>,
+) -> Result<(), String> {
+    let mut logs = state.logs.write().unwrap();
+    logs.clear();
+    Ok(())
+}
+
+// ============ Crash Reports ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrashReport {
+    pub path: String,
+    pub process_name: String,
+    pub timestamp: u64,
+    pub exception_type: Option<String>,
+    pub crash_reason: Option<String>,
+    pub stack_trace: Option<String>,
+}
+
+/// Get recent crash reports from the simulator
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn get_crash_reports(
+    bundle_id: Option<String>,
+    since_timestamp: Option<u64>,
+) -> Result<Vec<CrashReport>, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
+
+    // Simulator crash logs are in ~/Library/Logs/DiagnosticReports/
+    let crash_dir = PathBuf::from(&home)
+        .join("Library")
+        .join("Logs")
+        .join("DiagnosticReports");
+
+    if !crash_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut reports = Vec::new();
+    let since = since_timestamp.unwrap_or(0);
+
+    if let Ok(entries) = fs::read_dir(&crash_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            // Only process .crash and .ips files
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "crash" && ext != "ips" {
+                continue;
+            }
+
+            // Check modification time
+            let metadata = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let modified = metadata.modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            if modified < since {
+                continue;
+            }
+
+            // Read and parse the crash report
+            if let Ok(content) = fs::read_to_string(&path) {
+                let file_name = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+
+                // Filter by bundle ID if provided
+                if let Some(ref bid) = bundle_id {
+                    if !content.contains(bid) && !file_name.contains(bid) {
+                        continue;
+                    }
+                }
+
+                // Extract process name from filename (usually ProcessName-date.crash)
+                let process_name = file_name
+                    .split('-')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                // Parse crash details
+                let exception_type = content.lines()
+                    .find(|l| l.starts_with("Exception Type:"))
+                    .map(|l| l.replace("Exception Type:", "").trim().to_string());
+
+                let crash_reason = content.lines()
+                    .find(|l| l.starts_with("Termination Reason:") || l.starts_with("Exception Reason:"))
+                    .map(|l| l.split(':').skip(1).collect::<Vec<_>>().join(":").trim().to_string());
+
+                // Extract stack trace (Thread 0 Crashed section)
+                let stack_trace = extract_stack_trace(&content);
+
+                reports.push(CrashReport {
+                    path: path.to_string_lossy().to_string(),
+                    process_name,
+                    timestamp: modified,
+                    exception_type,
+                    crash_reason,
+                    stack_trace,
+                });
+            }
+        }
+    }
+
+    // Sort by timestamp descending
+    reports.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Limit to most recent 10
+    reports.truncate(10);
+
+    Ok(reports)
+}
+
+fn extract_stack_trace(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut in_crashed_thread = false;
+    let mut stack_lines = Vec::new();
+
+    for line in lines {
+        if line.contains("Thread 0 Crashed") || line.contains("Crashed Thread:") {
+            in_crashed_thread = true;
+            continue;
+        }
+        if in_crashed_thread {
+            if line.is_empty() || line.starts_with("Thread ") && !line.contains("Crashed") {
+                break;
+            }
+            stack_lines.push(line);
+        }
+    }
+
+    if stack_lines.is_empty() {
+        None
+    } else {
+        Some(stack_lines.join("\n"))
+    }
+}
+
+/// Save base64 screenshots to temp files and return their paths
+#[tauri::command]
+async fn save_screenshots_to_temp(
+    images: Vec<String>,  // base64 JPEG images
+    prefix: Option<String>,
+) -> Result<Vec<String>, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let temp_dir = std::env::temp_dir().join("nocur_recordings");
+    fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+    let prefix = prefix.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "recording".to_string())
+    });
+
+    let mut paths = Vec::new();
+
+    for (i, base64_data) in images.iter().enumerate() {
+        // Strip data URL prefix if present
+        let data = if base64_data.starts_with("data:") {
+            base64_data.split(',').nth(1).unwrap_or(base64_data)
+        } else {
+            base64_data
+        };
+
+        let bytes = STANDARD.decode(data)
+            .map_err(|e| format!("Failed to decode base64: {}", e))?;
+
+        let filename = format!("{}_{:03}.jpg", prefix, i);
+        let path = temp_dir.join(&filename);
+
+        fs::write(&path, bytes)
+            .map_err(|e| format!("Failed to write file: {}", e))?;
+
+        paths.push(path.to_string_lossy().to_string());
+    }
+
+    Ok(paths)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "macos")]
     let window_capture_state = Arc::new(WindowCaptureState::new());
+    #[cfg(target_os = "macos")]
+    let log_state = Arc::new(SimulatorLogState::new());
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -2155,7 +2591,9 @@ pub fn run() {
 
     #[cfg(target_os = "macos")]
     {
-        builder = builder.manage(window_capture_state);
+        builder = builder
+            .manage(window_capture_state)
+            .manage(log_state);
     }
 
     builder
@@ -2226,7 +2664,26 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             simulator_click,
             #[cfg(target_os = "macos")]
+            simulator_swipe,
+            #[cfg(target_os = "macos")]
+            simulator_home,
+            #[cfg(target_os = "macos")]
+            focus_simulator,
+            #[cfg(target_os = "macos")]
             find_simulator_window,
+            // Log streaming (macOS only)
+            #[cfg(target_os = "macos")]
+            start_simulator_logs,
+            #[cfg(target_os = "macos")]
+            stop_simulator_logs,
+            #[cfg(target_os = "macos")]
+            get_simulator_logs,
+            #[cfg(target_os = "macos")]
+            clear_simulator_logs,
+            #[cfg(target_os = "macos")]
+            get_crash_reports,
+            // Screenshot saving
+            save_screenshots_to_temp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -128,6 +128,72 @@ public struct ScreenshotResult: Encodable {
     }
 }
 
+// MARK: - Observation Models (for video workaround)
+
+/// A single frame captured during observation
+public struct ObserveFrame: Encodable {
+    public let timestamp: Double
+    public let image: String  // base64 JPEG
+
+    public init(timestamp: Double, image: String) {
+        self.timestamp = timestamp
+        self.image = image
+    }
+}
+
+/// Result of observing the simulator over time
+public struct ObserveResult: Encodable {
+    public let frames: [ObserveFrame]
+    public let duration: Double
+    public let frameCount: Int
+    public let simulator: String
+
+    public init(frames: [ObserveFrame], duration: Double, simulator: String) {
+        self.frames = frames
+        self.duration = duration
+        self.frameCount = frames.count
+        self.simulator = simulator
+    }
+}
+
+/// A region that changed between screenshots
+public struct ChangedRegion: Encodable {
+    public let x: Int
+    public let y: Int
+    public let width: Int
+    public let height: Int
+
+    public init(x: Int, y: Int, width: Int, height: Int) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+/// Result of comparing two screenshots
+public struct DiffResult: Encodable {
+    public let changesDetected: Bool
+    public let changePercentage: Double
+    public let changedRegions: [ChangedRegion]
+    public let summary: String
+    public let currentScreenshot: String?  // base64 of current state
+
+    public init(
+        changesDetected: Bool,
+        changePercentage: Double,
+        changedRegions: [ChangedRegion],
+        summary: String,
+        currentScreenshot: String? = nil
+    ) {
+        self.changesDetected = changesDetected
+        self.changePercentage = changePercentage
+        self.changedRegions = changedRegions
+        self.summary = summary
+        self.currentScreenshot = currentScreenshot
+    }
+}
+
 /// Result for compound interact command - returns screenshot after action
 public struct InteractResult: Encodable {
     public let action: String

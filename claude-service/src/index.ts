@@ -232,6 +232,38 @@ function createNocurSwiftServer(swiftPath: string) {
           return { content: [{ type: 'text' as const, text: result }] };
         }
       ),
+
+      // Sim Observe - Screenshot sequence for understanding behavior
+      tool(
+        'sim_observe',
+        'Observe simulator over time. Captures multiple screenshots to understand app behavior, animations, or transitions. Use this when you need to see how the app changes over time.',
+        {
+          duration: z.number().describe('Duration in seconds (max 5)'),
+          frames: z.number().optional().describe('Number of frames to capture (default: 5, max: 10)'),
+        },
+        async (args: { duration: number; frames?: number }) => {
+          const cmdArgs = ['sim', 'observe', '--duration', String(args.duration)];
+          if (args.frames) cmdArgs.push('--frames', String(args.frames));
+          const result = await runNocurSwift(cmdArgs);
+          return { content: [{ type: 'text' as const, text: result }] };
+        }
+      ),
+
+      // Sim Diff - Compare current screen to reference
+      tool(
+        'sim_diff',
+        'Compare current simulator screen to a reference screenshot. Useful for verifying UI changes were applied correctly.',
+        {
+          reference: z.string().describe('Path to reference screenshot to compare against'),
+          threshold: z.number().optional().describe('Minimum change percentage to report (default: 5)'),
+        },
+        async (args: { reference: string; threshold?: number }) => {
+          const cmdArgs = ['sim', 'diff', args.reference];
+          if (args.threshold !== undefined) cmdArgs.push('--threshold', String(args.threshold));
+          const result = await runNocurSwift(cmdArgs);
+          return { content: [{ type: 'text' as const, text: result }] };
+        }
+      ),
     ],
   });
 }
@@ -313,6 +345,8 @@ Use ui_interact for efficient interaction - it performs the action AND returns a
         'mcp__nocur-swift__sim_screenshot',
         'mcp__nocur-swift__sim_list',
         'mcp__nocur-swift__sim_boot',
+        'mcp__nocur-swift__sim_observe',
+        'mcp__nocur-swift__sim_diff',
         'mcp__nocur-swift__ui_interact',
         'mcp__nocur-swift__ui_hierarchy',
         'mcp__nocur-swift__ui_find',

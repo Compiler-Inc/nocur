@@ -642,6 +642,7 @@ export const AgentPane = ({
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     let unlistenPermission: UnlistenFn | undefined;
+    let unlistenUserMessage: UnlistenFn | undefined;
 
     const setup = async () => {
       // Listen for permission requests
@@ -649,6 +650,20 @@ export const AgentPane = ({
       unlistenPermission = await listen<PermissionRequest>("permission-request", async (event) => {
         console.log("Permission request received:", event.payload);
         setPermissionRequest(event.payload);
+      });
+
+      // Listen for user messages sent from outside (e.g., simulator recording)
+      unlistenUserMessage = await listen<{ content: string }>("user-message", (event) => {
+        console.log("User message received:", event.payload.content.slice(0, 100));
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now().toString(),
+            type: "user",
+            content: event.payload.content,
+            timestamp: new Date(),
+          },
+        ]);
       });
 
       unlisten = await listen<ClaudeEvent>("claude-event", (event) => {
@@ -940,6 +955,7 @@ export const AgentPane = ({
     return () => {
       if (unlisten) unlisten();
       if (unlistenPermission) unlistenPermission();
+      if (unlistenUserMessage) unlistenUserMessage();
       invoke("stop_claude_session").catch(console.error);
     };
   }, []); // Only run once on mount - skipPermissions is handled via ref
