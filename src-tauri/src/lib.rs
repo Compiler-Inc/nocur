@@ -13,7 +13,7 @@ mod permissions;
 #[cfg(target_os = "macos")]
 mod window_capture;
 
-use claude::{ClaudeSession, ClaudeState};
+use claude::{ClaudeSession, ClaudeState, ClaudeModel, ClaudeSessionConfig, SavedSession};
 use permissions::{PermissionState, PermissionResponse};
 #[cfg(target_os = "macos")]
 use window_capture::WindowCaptureState;
@@ -582,19 +582,42 @@ async fn load_image_from_path(path: String) -> Result<String, String> {
 async fn start_claude_session(
     working_dir: String,
     skip_permissions: Option<bool>,
+    model: Option<String>,
+    resume_session_id: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, Mutex<ClaudeState>>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut claude_state = state.lock();
 
-    // Drop existing session if any
+    // Save current session to history before dropping
+    if claude_state.session.is_some() {
+        claude_state.save_current_session(None);
+    }
+
+    // Drop existing session
     claude_state.session = None;
 
-    // Start new Claude session
-    let session = ClaudeSession::new(&working_dir, app_handle, skip_permissions.unwrap_or(false))?;
+    // Parse model string to enum
+    let model_enum = model.and_then(|m| match m.to_lowercase().as_str() {
+        "sonnet" => Some(ClaudeModel::Sonnet),
+        "opus" => Some(ClaudeModel::Opus),
+        "haiku" => Some(ClaudeModel::Haiku),
+        _ => None,
+    });
+
+    // Create session config
+    let config = ClaudeSessionConfig {
+        model: model_enum,
+        resume_session_id,
+        skip_permissions: skip_permissions.unwrap_or(false),
+    };
+
+    // Start new Claude session with config
+    let session = ClaudeSession::new_with_config(&working_dir, app_handle, config)?;
+    let session_id = session.get_session_id().to_string();
     claude_state.session = Some(session);
 
-    Ok(())
+    Ok(session_id)
 }
 
 #[tauri::command]
@@ -681,6 +704,65 @@ async fn set_claude_session_info(
 ) -> Result<(), String> {
     let mut claude_state = state.lock();
     claude_state.set_session_info(skills, model);
+    Ok(())
+}
+
+/// Get list of available Claude models
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+#[tauri::command]
+async fn get_available_models() -> Result<Vec<ModelInfo>, String> {
+    Ok(vec![
+        ModelInfo {
+            id: "sonnet".to_string(),
+            name: "Claude 4 Sonnet".to_string(),
+            description: "Fast and capable, great for most coding tasks".to_string(),
+        },
+        ModelInfo {
+            id: "opus".to_string(),
+            name: "Claude 4.5 Opus".to_string(),
+            description: "Most powerful, best for complex reasoning".to_string(),
+        },
+        ModelInfo {
+            id: "haiku".to_string(),
+            name: "Claude 3.5 Haiku".to_string(),
+            description: "Fastest and most economical".to_string(),
+        },
+    ])
+}
+
+/// Get recent sessions for resume functionality
+#[tauri::command]
+async fn get_recent_sessions(
+    state: State<'_, Mutex<ClaudeState>>,
+) -> Result<Vec<SavedSession>, String> {
+    let claude_state = state.lock();
+    Ok(claude_state.get_recent_sessions())
+}
+
+/// Get current session ID
+#[tauri::command]
+async fn get_current_session_id(
+    state: State<'_, Mutex<ClaudeState>>,
+) -> Result<Option<String>, String> {
+    let claude_state = state.lock();
+    Ok(claude_state.get_current_session_id())
+}
+
+/// Save current session to history (call before ending important sessions)
+#[tauri::command]
+async fn save_session_to_history(
+    last_message: Option<String>,
+    state: State<'_, Mutex<ClaudeState>>,
+) -> Result<(), String> {
+    let mut claude_state = state.lock();
+    claude_state.save_current_session(last_message);
     Ok(())
 }
 
@@ -1017,6 +1099,1002 @@ async fn get_git_info(path: Option<String>) -> Result<GitInfo, String> {
     })
 }
 
+// ============ Git Diff/Status Commands ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitChangedFile {
+    pub path: String,
+    pub status: String, // "M" modified, "A" added, "D" deleted, "?" untracked
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffStats {
+    pub total_additions: u32,
+    pub total_deletions: u32,
+    pub files: Vec<GitChangedFile>,
+}
+
+#[tauri::command]
+async fn get_git_diff_stats(path: Option<String>) -> Result<GitDiffStats, String> {
+    let working_dir = path.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+
+    // Get list of changed files with status
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&working_dir)
+        .output()
+        .map_err(|e| format!("Failed to get git status: {}", e))?;
+
+    let status_str = String::from_utf8_lossy(&status_output.stdout);
+
+    // Get diff stats (numstat)
+    let diff_output = Command::new("git")
+        .args(["diff", "--numstat", "HEAD"])
+        .current_dir(&working_dir)
+        .output()
+        .map_err(|e| format!("Failed to get git diff: {}", e))?;
+
+    let diff_str = String::from_utf8_lossy(&diff_output.stdout);
+
+    // Parse numstat for additions/deletions per file
+    let mut file_stats: std::collections::HashMap<String, (u32, u32)> = std::collections::HashMap::new();
+    for line in diff_str.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let additions = parts[0].parse().unwrap_or(0);
+            let deletions = parts[1].parse().unwrap_or(0);
+            let file_path = parts[2].to_string();
+            file_stats.insert(file_path, (additions, deletions));
+        }
+    }
+
+    // Parse status and build file list
+    let mut files = Vec::new();
+    let mut total_additions = 0u32;
+    let mut total_deletions = 0u32;
+
+    for line in status_str.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let status = line[..2].trim().to_string();
+        let file_path = line[3..].to_string();
+
+        let (additions, deletions) = file_stats.get(&file_path).copied().unwrap_or((0, 0));
+        total_additions += additions;
+        total_deletions += deletions;
+
+        files.push(GitChangedFile {
+            path: file_path,
+            status,
+            additions,
+            deletions,
+        });
+    }
+
+    Ok(GitDiffStats {
+        total_additions,
+        total_deletions,
+        files,
+    })
+}
+
+#[tauri::command]
+async fn get_file_diff(path: String, file_path: String) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["diff", "HEAD", "--", &file_path])
+        .current_dir(&path)
+        .output()
+        .map_err(|e| format!("Failed to get diff: {}", e))?;
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// ============ Open In Commands ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedProject {
+    pub project_type: String, // "xcode", "swift-package", "cargo", "node", "python"
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApp {
+    pub id: String,      // "xcode", "vscode", "cursor", "terminal", "finder"
+    pub name: String,
+    pub path: String,
+    pub icon: Option<String>, // SF Symbol name or emoji
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenInInfo {
+    pub projects: Vec<DetectedProject>,
+    pub apps: Vec<InstalledApp>,
+}
+
+/// Detect projects in a directory and installed apps
+#[tauri::command]
+async fn get_open_in_options(path: String) -> Result<OpenInInfo, String> {
+    let mut projects = Vec::new();
+    let mut apps = Vec::new();
+
+    // Detect projects in the directory
+    if let Ok(entries) = fs::read_dir(&path) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let entry_path = entry.path();
+            let name = entry_path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Xcode project
+            if name.ends_with(".xcodeproj") {
+                projects.push(DetectedProject {
+                    project_type: "xcode".to_string(),
+                    name: name.trim_end_matches(".xcodeproj").to_string(),
+                    path: entry_path.to_string_lossy().to_string(),
+                });
+            }
+            // Xcode workspace
+            else if name.ends_with(".xcworkspace") {
+                projects.push(DetectedProject {
+                    project_type: "xcode".to_string(),
+                    name: name.trim_end_matches(".xcworkspace").to_string(),
+                    path: entry_path.to_string_lossy().to_string(),
+                });
+            }
+            // Swift Package
+            else if name == "Package.swift" {
+                projects.push(DetectedProject {
+                    project_type: "swift-package".to_string(),
+                    name: PathBuf::from(&path).file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Package")
+                        .to_string(),
+                    path: entry_path.to_string_lossy().to_string(),
+                });
+            }
+            // Cargo (Rust)
+            else if name == "Cargo.toml" {
+                projects.push(DetectedProject {
+                    project_type: "cargo".to_string(),
+                    name: PathBuf::from(&path).file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Cargo")
+                        .to_string(),
+                    path: entry_path.to_string_lossy().to_string(),
+                });
+            }
+            // Node.js
+            else if name == "package.json" {
+                projects.push(DetectedProject {
+                    project_type: "node".to_string(),
+                    name: PathBuf::from(&path).file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Node")
+                        .to_string(),
+                    path: entry_path.to_string_lossy().to_string(),
+                });
+            }
+        }
+    }
+
+    // Check for installed apps
+    let app_checks = vec![
+        ("xcode", "Xcode", "/Applications/Xcode.app"),
+        ("xcode-beta", "Xcode Beta", "/Applications/Xcode-beta.app"),
+        ("vscode", "VS Code", "/Applications/Visual Studio Code.app"),
+        ("cursor", "Cursor", "/Applications/Cursor.app"),
+        ("zed", "Zed", "/Applications/Zed.app"),
+        ("sublime", "Sublime Text", "/Applications/Sublime Text.app"),
+        ("fleet", "Fleet", "/Applications/Fleet.app"),
+        ("nova", "Nova", "/Applications/Nova.app"),
+        ("terminal", "Terminal", "/System/Applications/Utilities/Terminal.app"),
+        ("iterm", "iTerm", "/Applications/iTerm.app"),
+        ("warp", "Warp", "/Applications/Warp.app"),
+        ("ghostty", "Ghostty", "/Applications/Ghostty.app"),
+        ("alacritty", "Alacritty", "/Applications/Alacritty.app"),
+        ("kitty", "kitty", "/Applications/kitty.app"),
+    ];
+
+    for (id, name, app_path) in app_checks {
+        if PathBuf::from(app_path).exists() {
+            apps.push(InstalledApp {
+                id: id.to_string(),
+                name: name.to_string(),
+                path: app_path.to_string(),
+                icon: None,
+            });
+        }
+    }
+
+    // Finder is always available
+    apps.push(InstalledApp {
+        id: "finder".to_string(),
+        name: "Finder".to_string(),
+        path: "/System/Library/CoreServices/Finder.app".to_string(),
+        icon: None,
+    });
+
+    Ok(OpenInInfo { projects, apps })
+}
+
+/// Open a path in a specific application
+#[tauri::command]
+async fn open_in_app(app_id: String, path: String, project_path: Option<String>) -> Result<(), String> {
+    let target_path = project_path.unwrap_or(path.clone());
+
+    match app_id.as_str() {
+        "finder" => {
+            Command::new("open")
+                .arg(&target_path)
+                .spawn()
+                .map_err(|e| format!("Failed to open Finder: {}", e))?;
+        }
+        "terminal" => {
+            Command::new("open")
+                .args(["-a", "Terminal", &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open Terminal: {}", e))?;
+        }
+        "iterm" => {
+            Command::new("open")
+                .args(["-a", "iTerm", &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open iTerm: {}", e))?;
+        }
+        "warp" => {
+            Command::new("open")
+                .args(["-a", "Warp", &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open Warp: {}", e))?;
+        }
+        "ghostty" => {
+            Command::new("open")
+                .args(["-a", "Ghostty", &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open Ghostty: {}", e))?;
+        }
+        "alacritty" => {
+            Command::new("open")
+                .args(["-a", "Alacritty", &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open Alacritty: {}", e))?;
+        }
+        "kitty" => {
+            Command::new("open")
+                .args(["-a", "kitty", &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open kitty: {}", e))?;
+        }
+        "xcode" | "xcode-beta" => {
+            let app_name = if app_id == "xcode-beta" { "Xcode-beta" } else { "Xcode" };
+            Command::new("open")
+                .args(["-a", app_name, &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open Xcode: {}", e))?;
+        }
+        "vscode" => {
+            // Try 'code' command first, fall back to open -a
+            let code_result = Command::new("code")
+                .arg(&target_path)
+                .spawn();
+
+            if code_result.is_err() {
+                Command::new("open")
+                    .args(["-a", "Visual Studio Code", &target_path])
+                    .spawn()
+                    .map_err(|e| format!("Failed to open VS Code: {}", e))?;
+            }
+        }
+        "cursor" => {
+            // Try 'cursor' command first, fall back to open -a
+            let cursor_result = Command::new("cursor")
+                .arg(&target_path)
+                .spawn();
+
+            if cursor_result.is_err() {
+                Command::new("open")
+                    .args(["-a", "Cursor", &target_path])
+                    .spawn()
+                    .map_err(|e| format!("Failed to open Cursor: {}", e))?;
+            }
+        }
+        "zed" => {
+            let zed_result = Command::new("zed")
+                .arg(&target_path)
+                .spawn();
+
+            if zed_result.is_err() {
+                Command::new("open")
+                    .args(["-a", "Zed", &target_path])
+                    .spawn()
+                    .map_err(|e| format!("Failed to open Zed: {}", e))?;
+            }
+        }
+        "sublime" => {
+            let subl_result = Command::new("subl")
+                .arg(&target_path)
+                .spawn();
+
+            if subl_result.is_err() {
+                Command::new("open")
+                    .args(["-a", "Sublime Text", &target_path])
+                    .spawn()
+                    .map_err(|e| format!("Failed to open Sublime Text: {}", e))?;
+            }
+        }
+        "fleet" => {
+            Command::new("open")
+                .args(["-a", "Fleet", &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open Fleet: {}", e))?;
+        }
+        "nova" => {
+            Command::new("open")
+                .args(["-a", "Nova", &target_path])
+                .spawn()
+                .map_err(|e| format!("Failed to open Nova: {}", e))?;
+        }
+        _ => {
+            return Err(format!("Unknown app: {}", app_id));
+        }
+    }
+
+    Ok(())
+}
+
+/// Copy path to clipboard
+#[tauri::command]
+async fn copy_to_clipboard(text: String) -> Result<(), String> {
+    Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(stdin) = child.stdin.as_mut() {
+                use std::io::Write;
+                stdin.write_all(text.as_bytes())?;
+            }
+            child.wait()
+        })
+        .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+
+    Ok(())
+}
+
+// ============ Git Worktree Commands ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktree {
+    pub path: String,
+    pub branch: String,
+    pub is_main: bool,
+    pub session_id: Option<String>,
+}
+
+#[tauri::command]
+async fn list_worktrees(path: Option<String>) -> Result<Vec<GitWorktree>, String> {
+    let working_dir = path.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&working_dir)
+        .output()
+        .map_err(|e| format!("Failed to list worktrees: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git worktree list failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut worktrees = Vec::new();
+    let mut current_worktree: Option<GitWorktree> = None;
+
+    for line in stdout.lines() {
+        if line.starts_with("worktree ") {
+            // Save previous worktree if exists
+            if let Some(wt) = current_worktree.take() {
+                worktrees.push(wt);
+            }
+            // Start new worktree
+            let path = line.strip_prefix("worktree ").unwrap_or("").to_string();
+            current_worktree = Some(GitWorktree {
+                path,
+                branch: String::new(),
+                is_main: false,
+                session_id: None,
+            });
+        } else if line.starts_with("branch ") {
+            if let Some(ref mut wt) = current_worktree {
+                let branch = line.strip_prefix("branch refs/heads/").unwrap_or(
+                    line.strip_prefix("branch ").unwrap_or("")
+                );
+                wt.branch = branch.to_string();
+                // Check if this is a session worktree (branch name contains "session-")
+                if branch.starts_with("session-") {
+                    wt.session_id = Some(branch.strip_prefix("session-").unwrap_or(branch).to_string());
+                }
+            }
+        } else if line == "bare" {
+            // Skip bare worktrees
+            current_worktree = None;
+        }
+    }
+
+    // Don't forget the last worktree
+    if let Some(wt) = current_worktree {
+        worktrees.push(wt);
+    }
+
+    // Mark the main worktree (first one)
+    if let Some(first) = worktrees.first_mut() {
+        first.is_main = true;
+    }
+
+    Ok(worktrees)
+}
+
+#[tauri::command]
+async fn create_session_worktree(
+    path: String,
+    session_id: String,
+) -> Result<GitWorktree, String> {
+    // Create branch name from session ID
+    let branch_name = format!("session-{}", session_id.chars().take(8).collect::<String>());
+    let worktree_path = format!("{}/../{}-worktree", path, branch_name);
+
+    // First create the branch from current HEAD
+    let branch_output = Command::new("git")
+        .args(["branch", &branch_name])
+        .current_dir(&path)
+        .output()
+        .map_err(|e| format!("Failed to create branch: {}", e))?;
+
+    if !branch_output.status.success() {
+        let stderr = String::from_utf8_lossy(&branch_output.stderr);
+        // Branch might already exist, which is fine
+        if !stderr.contains("already exists") {
+            return Err(format!("Failed to create branch: {}", stderr));
+        }
+    }
+
+    // Create the worktree
+    let output = Command::new("git")
+        .args(["worktree", "add", &worktree_path, &branch_name])
+        .current_dir(&path)
+        .output()
+        .map_err(|e| format!("Failed to create worktree: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to create worktree: {}", stderr));
+    }
+
+    // Resolve the full path
+    let full_path = std::fs::canonicalize(&worktree_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(worktree_path);
+
+    Ok(GitWorktree {
+        path: full_path,
+        branch: branch_name,
+        is_main: false,
+        session_id: Some(session_id),
+    })
+}
+
+#[tauri::command]
+async fn remove_worktree(worktree_path: String, force: Option<bool>) -> Result<(), String> {
+    let mut args = vec!["worktree", "remove"];
+    if force.unwrap_or(false) {
+        args.push("--force");
+    }
+    args.push(&worktree_path);
+
+    let output = Command::new("git")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("Failed to remove worktree: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to remove worktree: {}", stderr));
+    }
+
+    Ok(())
+}
+
+// ============ Claude Code Session History ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeCodeSession {
+    pub id: String,
+    pub project_path: String,
+    pub project_hash: String,
+    pub created_at: u64,
+    pub last_message: Option<String>,
+    pub message_count: u32,
+}
+
+/// Get project hash like Claude Code does (SHA256 of path)
+fn get_project_hash(path: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+/// Message from a session file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolUsed {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMessage {
+    pub id: String,
+    pub message_type: String, // "user" or "assistant"
+    pub content: String,
+    pub timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_used: Option<Vec<ToolUsed>>,
+}
+
+/// Load messages from a Claude Code session file
+#[tauri::command]
+async fn load_session_messages(project_path: String, session_id: String) -> Result<Vec<SessionMessage>, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
+    let claude_projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+
+    // Build list of paths to check (current + parents up to home)
+    let mut paths_to_check = Vec::new();
+    let mut current = PathBuf::from(&project_path);
+    let home_path = PathBuf::from(&home);
+
+    while current.starts_with(&home_path) && current != home_path {
+        paths_to_check.push(current.clone());
+        if !current.pop() {
+            break;
+        }
+    }
+
+    // Find the session file
+    let mut session_file = None;
+    for path in paths_to_check {
+        let path_str = path.to_string_lossy().to_string();
+        let project_dir_name = path_str.replace("/", "-");
+        let project_dir = claude_projects_dir.join(&project_dir_name);
+        let file_path = project_dir.join(format!("{}.jsonl", session_id));
+
+        if file_path.exists() {
+            session_file = Some(file_path);
+            break;
+        }
+    }
+
+    let Some(file_path) = session_file else {
+        return Ok(vec![]);
+    };
+
+    // Read and parse the JSONL file
+    let content = fs::read_to_string(&file_path)
+        .map_err(|e| format!("Failed to read session file: {}", e))?;
+
+    let mut messages = Vec::new();
+    let mut msg_counter = 0u64;
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            if msg_type == "user" || msg_type == "assistant" {
+                // Extract content and tools from the message
+                let (content, tools_used) = if let Some(msg) = json.get("message") {
+                    if let Some(content) = msg.get("content") {
+                        // Content can be a string or array of blocks
+                        if let Some(s) = content.as_str() {
+                            (s.to_string(), None)
+                        } else if let Some(arr) = content.as_array() {
+                            // Extract text and tool_use from content blocks
+                            let mut texts = Vec::new();
+                            let mut tools = Vec::new();
+
+                            for block in arr {
+                                let block_type = block.get("type").and_then(|t| t.as_str());
+                                match block_type {
+                                    Some("text") => {
+                                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                            texts.push(text.to_string());
+                                        }
+                                    }
+                                    Some("tool_use") => {
+                                        if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                            let input = block.get("input")
+                                                .map(|i| serde_json::to_string(i).unwrap_or_default());
+                                            tools.push(ToolUsed {
+                                                name: name.to_string(),
+                                                input,
+                                            });
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            let content = texts.join("\n");
+                            let tools_used = if tools.is_empty() { None } else { Some(tools) };
+                            (content, tools_used)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+
+                // Skip empty content (unless there are tools)
+                if content.trim().is_empty() && tools_used.is_none() {
+                    continue;
+                }
+
+                msg_counter += 1;
+                messages.push(SessionMessage {
+                    id: format!("hist-{}", msg_counter),
+                    message_type: msg_type.to_string(),
+                    content,
+                    timestamp: msg_counter, // Use counter as pseudo-timestamp for ordering
+                    tools_used,
+                });
+            }
+        }
+    }
+
+    Ok(messages)
+}
+
+/// List Claude Code sessions for a project
+#[tauri::command]
+async fn list_claude_code_sessions(project_path: String) -> Result<Vec<ClaudeCodeSession>, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
+    let claude_projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+
+    if !claude_projects_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut sessions = Vec::new();
+
+    // Claude Code stores sessions directly in ~/.claude/projects/<project-path-encoded>/
+    // The directory name is the project path with / replaced by -
+    // e.g. /Users/foo/project becomes -Users-foo-project
+
+    // Build list of paths to check: current path + all parent paths up to home
+    let mut paths_to_check = Vec::new();
+    let mut current = PathBuf::from(&project_path);
+    let home_path = PathBuf::from(&home);
+
+    // Add current path and walk up to home directory
+    while current.starts_with(&home_path) && current != home_path {
+        paths_to_check.push(current.clone());
+        if !current.pop() {
+            break;
+        }
+    }
+
+    // Find the first path that has a matching sessions directory
+    let mut target_dir = None;
+    for path in paths_to_check {
+        let path_str = path.to_string_lossy().to_string();
+        let project_dir_name = path_str.replace("/", "-");
+        let project_dir = claude_projects_dir.join(&project_dir_name);
+
+        if project_dir.exists() {
+            // Check if it has any .jsonl files
+            if let Ok(entries) = fs::read_dir(&project_dir) {
+                let has_sessions = entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"));
+                if has_sessions {
+                    target_dir = Some(project_dir);
+                    break;
+                }
+            }
+        }
+    }
+
+    let Some(project_dir) = target_dir else {
+        return Ok(vec![]);
+    };
+
+    // Get the project hash from directory name
+    let project_hash = project_dir.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Read .jsonl files directly from the project directory (not a sessions subdirectory)
+    if let Ok(session_entries) = fs::read_dir(&project_dir) {
+        for session_entry in session_entries.filter_map(|e| e.ok()) {
+            let session_path = session_entry.path();
+            if !session_path.extension().map_or(false, |ext| ext == "jsonl") {
+                continue;
+            }
+
+            // Get session ID from filename (without .jsonl)
+            let session_id = session_path.file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Get file metadata for timestamp
+            let metadata = fs::metadata(&session_path).ok();
+            let created_at = metadata.as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Read first few lines to get last message and count
+            let (last_message, message_count) = if let Ok(content) = fs::read_to_string(&session_path) {
+                let lines: Vec<&str> = content.lines().collect();
+                let count = lines.len() as u32;
+
+                // Find last assistant message
+                let last_msg = lines.iter().rev().find_map(|line| {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                        if json.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                            return json.get("message")
+                                .and_then(|m| m.get("content"))
+                                .and_then(|c| {
+                                    // Content can be a string or array
+                                    if let Some(s) = c.as_str() {
+                                        return Some(s.chars().take(100).collect::<String>());
+                                    }
+                                    if let Some(arr) = c.as_array() {
+                                        // Find first text block
+                                        for item in arr {
+                                            if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                                    return Some(text.chars().take(100).collect::<String>());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None
+                                });
+                        }
+                    }
+                    None
+                });
+                (last_msg, count)
+            } else {
+                (None, 0)
+            };
+
+            sessions.push(ClaudeCodeSession {
+                id: session_id,
+                project_path: project_path.clone(),
+                project_hash: project_hash.clone(),
+                created_at,
+                last_message,
+                message_count,
+            });
+        }
+    }
+
+    // Sort by created_at descending (most recent first)
+    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    // Limit to most recent 20 sessions
+    sessions.truncate(20);
+
+    Ok(sessions)
+}
+
+// ============ User Preferences ============
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPreferences {
+    pub model: Option<String>,
+    pub skills: Vec<String>,
+    pub skip_permissions: bool,
+    #[serde(default)]
+    pub session_names: std::collections::HashMap<String, String>,
+    /// Maps project path to active session ID
+    #[serde(default)]
+    pub active_sessions: std::collections::HashMap<String, String>,
+}
+
+fn get_preferences_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".nocur").join("preferences.json")
+}
+
+#[tauri::command]
+async fn get_user_preferences() -> Result<UserPreferences, String> {
+    let prefs_path = get_preferences_path();
+
+    if prefs_path.exists() {
+        let content = fs::read_to_string(&prefs_path)
+            .map_err(|e| format!("Failed to read preferences: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse preferences: {}", e))
+    } else {
+        Ok(UserPreferences::default())
+    }
+}
+
+#[tauri::command]
+async fn save_user_preferences(preferences: UserPreferences) -> Result<(), String> {
+    let prefs_path = get_preferences_path();
+
+    // Create .nocur directory if needed
+    if let Some(parent) = prefs_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create preferences directory: {}", e))?;
+    }
+
+    let content = serde_json::to_string_pretty(&preferences)
+        .map_err(|e| format!("Failed to serialize preferences: {}", e))?;
+
+    fs::write(&prefs_path, content)
+        .map_err(|e| format!("Failed to write preferences: {}", e))?;
+
+    Ok(())
+}
+
+// City names for stable session naming
+const CITY_NAMES: &[&str] = &[
+    "tokyo", "paris", "london", "berlin", "sydney", "cairo", "mumbai", "seoul",
+    "rome", "vienna", "prague", "lisbon", "dublin", "oslo", "stockholm", "helsinki",
+    "amsterdam", "brussels", "zurich", "milan", "barcelona", "madrid", "athens",
+    "istanbul", "dubai", "singapore", "bangkok", "hanoi", "manila", "jakarta",
+    "nairobi", "lagos", "casablanca", "capetown", "montreal", "vancouver", "seattle",
+    "denver", "austin", "miami", "boston", "chicago", "portland", "phoenix",
+    "havana", "lima", "bogota", "santiago", "buenosaires", "rio", "saopaulo",
+    "reykjavik", "tallinn", "riga", "vilnius", "warsaw", "budapest", "bucharest",
+    "sofia", "belgrade", "zagreb", "ljubljana", "bratislava", "kyiv", "minsk"
+];
+
+/// Get or create a stable city name for a session ID
+#[tauri::command]
+async fn get_session_name(session_id: String) -> Result<String, String> {
+    let prefs_path = get_preferences_path();
+
+    // Load existing preferences
+    let mut prefs: UserPreferences = if prefs_path.exists() {
+        let content = fs::read_to_string(&prefs_path)
+            .map_err(|e| format!("Failed to read preferences: {}", e))?;
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        UserPreferences::default()
+    };
+
+    // Check if we already have a name for this session
+    if let Some(name) = prefs.session_names.get(&session_id) {
+        return Ok(name.clone());
+    }
+
+    // Generate a new name - pick one not already used
+    let used_names: std::collections::HashSet<&String> = prefs.session_names.values().collect();
+    let available_name = CITY_NAMES
+        .iter()
+        .find(|&&name| !used_names.contains(&name.to_string()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            // If all names used, generate one with a suffix
+            let base_name = CITY_NAMES[prefs.session_names.len() % CITY_NAMES.len()];
+            format!("{}-{}", base_name, prefs.session_names.len() / CITY_NAMES.len() + 1)
+        });
+
+    // Save the new mapping
+    prefs.session_names.insert(session_id, available_name.clone());
+
+    // Write back to file
+    if let Some(parent) = prefs_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let content = serde_json::to_string_pretty(&prefs)
+        .map_err(|e| format!("Failed to serialize preferences: {}", e))?;
+    fs::write(&prefs_path, content)
+        .map_err(|e| format!("Failed to write preferences: {}", e))?;
+
+    Ok(available_name)
+}
+
+/// Get all session name mappings
+#[tauri::command]
+async fn get_session_names() -> Result<std::collections::HashMap<String, String>, String> {
+    let prefs_path = get_preferences_path();
+
+    if prefs_path.exists() {
+        let content = fs::read_to_string(&prefs_path)
+            .map_err(|e| format!("Failed to read preferences: {}", e))?;
+        let prefs: UserPreferences = serde_json::from_str(&content).unwrap_or_default();
+        Ok(prefs.session_names)
+    } else {
+        Ok(std::collections::HashMap::new())
+    }
+}
+
+/// Get the active session ID for a project
+#[tauri::command]
+async fn get_active_session(project_path: String) -> Result<Option<String>, String> {
+    let prefs_path = get_preferences_path();
+
+    if prefs_path.exists() {
+        let content = fs::read_to_string(&prefs_path)
+            .map_err(|e| format!("Failed to read preferences: {}", e))?;
+        let prefs: UserPreferences = serde_json::from_str(&content).unwrap_or_default();
+        Ok(prefs.active_sessions.get(&project_path).cloned())
+    } else {
+        Ok(None)
+    }
+}
+
+/// Set the active session ID for a project
+#[tauri::command]
+async fn set_active_session(project_path: String, session_id: String) -> Result<(), String> {
+    let prefs_path = get_preferences_path();
+
+    // Ensure directory exists
+    if let Some(parent) = prefs_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create prefs directory: {}", e))?;
+    }
+
+    // Load existing preferences or create default
+    let mut prefs: UserPreferences = if prefs_path.exists() {
+        let content = fs::read_to_string(&prefs_path)
+            .map_err(|e| format!("Failed to read preferences: {}", e))?;
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        UserPreferences::default()
+    };
+
+    // Set active session for this project
+    prefs.active_sessions.insert(project_path, session_id);
+
+    // Save preferences
+    let content = serde_json::to_string_pretty(&prefs)
+        .map_err(|e| format!("Failed to serialize preferences: {}", e))?;
+    fs::write(&prefs_path, content)
+        .map_err(|e| format!("Failed to save preferences: {}", e))?;
+
+    Ok(())
+}
+
 // ============ Window Capture Commands (macOS only) ============
 
 #[cfg(target_os = "macos")]
@@ -1110,6 +2188,10 @@ pub fn run() {
             cancel_claude_request,
             get_claude_session_info,
             set_claude_session_info,
+            get_available_models,
+            get_recent_sessions,
+            get_current_session_id,
+            save_session_to_history,
             set_skip_permissions,
             respond_to_permission,
             add_permission_rule,
@@ -1118,6 +2200,24 @@ pub fn run() {
             create_skill,
             open_skills_folder,
             get_git_info,
+            get_git_diff_stats,
+            get_file_diff,
+            get_open_in_options,
+            open_in_app,
+            copy_to_clipboard,
+            list_worktrees,
+            create_session_worktree,
+            remove_worktree,
+            // Claude Code sessions
+            list_claude_code_sessions,
+            load_session_messages,
+            // User preferences
+            get_user_preferences,
+            save_user_preferences,
+            get_session_name,
+            get_session_names,
+            get_active_session,
+            set_active_session,
             // Window capture (macOS only)
             #[cfg(target_os = "macos")]
             start_simulator_stream,

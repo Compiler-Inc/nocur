@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import ReactMarkdown from "react-markdown";
@@ -10,15 +10,21 @@ interface ClaudeEvent {
   content: string;
   toolName: string | null;
   toolInput: string | null;
+  toolId: string | null;
   isError: boolean;
   rawJson: string | null;
   skills?: string[];
   model?: string;
+  sessionId?: string;
   // Token usage
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  // SDK-specific fields
+  cost?: number;
+  duration?: number;
+  numTurns?: number;
 }
 
 interface Message {
@@ -44,6 +50,33 @@ interface ClaudeSessionInfo {
   active: boolean;
   skills: string[];
   model: string | null;
+}
+
+interface ModelInfo {
+  id: string;
+  name: string;
+  description: string;
+}
+
+interface SavedSession {
+  sessionId: string;
+  model: string | null;
+  createdAt: number;
+  lastMessagePreview: string | null;
+}
+
+interface UserPreferences {
+  model: string | null;
+  skills: string[];
+  skipPermissions: boolean;
+}
+
+interface SessionMessage {
+  id: string;
+  messageType: string;
+  content: string;
+  timestamp: number;
+  toolsUsed?: Array<{ name: string; input?: string }>;
 }
 
 const PROJECT_DIR = "<REPO_ROOT>"; // TODO: Make dynamic
@@ -231,6 +264,15 @@ const parseBashCommand = (cmd: string): string => {
   return `Running ${binary}`;
 };
 
+// Normalize tool names (strip MCP prefix)
+const normalizeToolName = (toolName: string): string => {
+  // mcp__nocur-swift__sim_screenshot -> sim_screenshot
+  if (toolName.startsWith("mcp__")) {
+    return toolName.split("__").pop() || toolName;
+  }
+  return toolName;
+};
+
 // Format tool calls in a user-friendly way
 const formatToolDisplay = (toolName: string, toolInput: string | undefined): {
   summary: string;
@@ -238,76 +280,125 @@ const formatToolDisplay = (toolName: string, toolInput: string | undefined): {
   todos?: Array<{ content: string; status: string }>;
   diff?: { oldString: string; newString: string };
 } => {
-  if (!toolInput) return { summary: toolName };
+  // Handle MCP tool names (e.g., mcp__nocur-swift__sim_screenshot -> sim_screenshot)
+  const normalizedName = toolName.startsWith("mcp__")
+    ? toolName.split("__").pop() || toolName
+    : toolName;
 
-  try {
-    const parsed = JSON.parse(toolInput);
-
-    switch (toolName) {
-      case "Read": {
-        const path = parsed.file_path || "";
-        const filename = path.split("/").pop() || path;
-        return { summary: `Reading ${filename}`, detail: path };
-      }
-      case "Edit": {
-        const path = parsed.file_path || "";
-        const filename = path.split("/").pop() || path;
-        const oldString = parsed.old_string || "";
-        const newString = parsed.new_string || "";
-        return {
-          summary: `Editing ${filename}`,
-          detail: path,
-          diff: oldString || newString ? { oldString, newString } : undefined
-        };
-      }
-      case "Write": {
-        const path = parsed.file_path || "";
-        const filename = path.split("/").pop() || path;
-        return { summary: `Writing ${filename}`, detail: path };
-      }
-      case "Bash": {
-        const cmd = parsed.command || "";
-        // Parse the command intelligently
-        const summary = parseBashCommand(cmd);
-        return { summary, detail: cmd };
-      }
-      case "Glob": {
-        return { summary: `Finding ${parsed.pattern || "files"}` };
-      }
-      case "Grep": {
-        const pattern = parsed.pattern || "";
-        return { summary: `Searching "${pattern.slice(0, 30)}${pattern.length > 30 ? "..." : ""}"` };
-      }
-      case "Task": {
-        return { summary: parsed.description || "Running agent task" };
-      }
-      case "TodoWrite": {
-        const todos = parsed.todos || [];
-        return {
-          summary: `Updating ${todos.length} todo${todos.length !== 1 ? "s" : ""}`,
-          todos: todos.map((t: { content: string; status: string }) => ({ content: t.content, status: t.status }))
-        };
-      }
-      case "WebFetch": {
-        const url = parsed.url || "";
-        try {
-          const hostname = new URL(url).hostname;
-          return { summary: `Fetching ${hostname}`, detail: url };
-        } catch {
-          return { summary: "Fetching URL", detail: url };
-        }
-      }
-      default:
-        return { summary: toolName };
+  let parsed: Record<string, unknown> = {};
+  if (toolInput) {
+    try {
+      parsed = JSON.parse(toolInput);
+    } catch {
+      // Ignore parse errors
     }
-  } catch {
-    return { summary: toolName };
+  }
+
+  switch (normalizedName) {
+    // nocur-swift tools
+    case "sim_screenshot":
+      return { summary: "Taking screenshot" };
+    case "sim_list":
+      return { summary: parsed.booted ? "Listing booted simulators" : "Listing simulators" };
+    case "sim_boot":
+      return { summary: `Booting ${parsed.name || "simulator"}` };
+    case "ui_interact": {
+      if (parsed.tapX !== undefined && parsed.tapY !== undefined) {
+        return { summary: `Tapping at (${parsed.tapX}, ${parsed.tapY})` };
+      }
+      if (parsed.tapId) return { summary: `Tapping "${parsed.tapId}"` };
+      if (parsed.tapLabel) return { summary: `Tapping "${parsed.tapLabel}"` };
+      if (parsed.typeText) return { summary: `Typing "${String(parsed.typeText).slice(0, 20)}..."` };
+      if (parsed.scroll) return { summary: `Scrolling ${parsed.scroll}` };
+      return { summary: "Interacting with UI" };
+    }
+    case "ui_hierarchy":
+      return { summary: "Getting view hierarchy" };
+    case "ui_find": {
+      if (parsed.text) return { summary: `Finding UI: "${parsed.text}"` };
+      if (parsed.id) return { summary: `Finding UI by ID: "${parsed.id}"` };
+      if (parsed.type) return { summary: `Finding UI by type: "${parsed.type}"` };
+      return { summary: "Finding UI elements" };
+    }
+    case "app_build":
+      return { summary: "Building Xcode project", detail: String(parsed.project || "") };
+    case "app_launch":
+      return { summary: `Launching ${parsed.bundleId || "app"}` };
+    case "app_kill":
+      return { summary: `Killing ${parsed.bundleId || "app"}` };
+
+    // Standard Claude Code tools
+    case "Read": {
+      const path = String(parsed.file_path || "");
+      const filename = path.split("/").pop() || path;
+      return { summary: `Reading ${filename}`, detail: path };
+    }
+    case "Edit": {
+      const path = String(parsed.file_path || "");
+      const filename = path.split("/").pop() || path;
+      const oldString = String(parsed.old_string || "");
+      const newString = String(parsed.new_string || "");
+      return {
+        summary: `Editing ${filename}`,
+        detail: path,
+        diff: oldString || newString ? { oldString, newString } : undefined
+      };
+    }
+    case "Write": {
+      const path = String(parsed.file_path || "");
+      const filename = path.split("/").pop() || path;
+      return { summary: `Writing ${filename}`, detail: path };
+    }
+    case "Bash": {
+      const cmd = String(parsed.command || "");
+      const summary = parseBashCommand(cmd);
+      return { summary, detail: cmd };
+    }
+    case "Glob": {
+      return { summary: `Finding ${parsed.pattern || "files"}` };
+    }
+    case "Grep": {
+      const pattern = String(parsed.pattern || "");
+      return { summary: `Searching "${pattern.slice(0, 30)}${pattern.length > 30 ? "..." : ""}"` };
+    }
+    case "Task": {
+      return { summary: String(parsed.description || "Running agent task") };
+    }
+    case "TodoWrite": {
+      const todos = (parsed.todos as Array<{ content: string; status: string }>) || [];
+      return {
+        summary: `Updating ${todos.length} todo${todos.length !== 1 ? "s" : ""}`,
+        todos: todos.map((t) => ({ content: t.content, status: t.status }))
+      };
+    }
+    case "WebFetch": {
+      const url = String(parsed.url || "");
+      try {
+        const hostname = new URL(url).hostname;
+        return { summary: `Fetching ${hostname}`, detail: url };
+      } catch {
+        return { summary: "Fetching URL", detail: url };
+      }
+    }
+    default:
+      // Try to make any remaining tool names more readable
+      return { summary: normalizedName.replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2") };
   }
 };
 
 type SessionStatus = "disconnected" | "connecting" | "connected" | "working" | "error" | "interrupted";
 
-export const AgentPane = () => {
+interface AgentPaneProps {
+  onSessionChange?: (sessionId: string | null) => void;
+  pendingSessionAction?: { type: "resume" | "new"; sessionId?: string } | null;
+  onPendingSessionActionHandled?: () => void;
+}
+
+export const AgentPane = ({
+  onSessionChange,
+  pendingSessionAction,
+  onPendingSessionActionHandled,
+}: AgentPaneProps) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<SessionStatus>("disconnected");
@@ -322,8 +413,15 @@ export const AgentPane = () => {
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [skipPermissions, setSkipPermissions] = useState(false);
   const [availableSkills, setAvailableSkills] = useState<string[]>([]);
-  const [claudeModel, setClaudeModel] = useState<string | null>(null);
+  const [_claudeModel, setClaudeModel] = useState<string | null>(null);
   const [showSkillsModal, setShowSkillsModal] = useState(false);
+  // Model selection and resume state
+  const [selectedModel, setSelectedModel] = useState<string>("sonnet");
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
+  const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [showModelMenu, setShowModelMenu] = useState(false);
+  const [showResumeMenu, setShowResumeMenu] = useState(false);
   const [tokenUsage, setTokenUsage] = useState<{
     input: number;
     output: number;
@@ -342,9 +440,59 @@ export const AgentPane = () => {
   const processedEventsRef = useRef<Set<string>>(new Set());
   const responseStartTimeRef = useRef<number>(0);
   const skipPermissionsRef = useRef(skipPermissions);
+  // Use ref for turn tools to avoid React batching issues with rapid events
+  const currentTurnToolsRef = useRef<Array<{ name: string; input?: string }>>([]);
 
   // Animated token counter
   const animatedOutputTokens = useAnimatedCounter(tokenUsage.output);
+
+  // Track if preferences have been loaded (to avoid saving defaults on mount)
+  const prefsLoadedRef = useRef(false);
+
+  // Load user preferences on mount
+  useEffect(() => {
+    const loadPreferences = async () => {
+      try {
+        const prefs = await invoke<UserPreferences>("get_user_preferences");
+        console.log("Loaded preferences:", prefs);
+        if (prefs.model) {
+          setSelectedModel(prefs.model);
+        }
+        if (prefs.skipPermissions !== undefined) {
+          setSkipPermissions(prefs.skipPermissions);
+        }
+        // Mark preferences as loaded after a short delay
+        setTimeout(() => {
+          prefsLoadedRef.current = true;
+        }, 100);
+      } catch (err) {
+        console.error("Failed to load preferences:", err);
+        prefsLoadedRef.current = true;
+      }
+    };
+    loadPreferences();
+  }, []);
+
+  // Save preferences when they change (but not on initial load)
+  useEffect(() => {
+    if (!prefsLoadedRef.current) return;
+
+    const savePreferences = async () => {
+      try {
+        await invoke("save_user_preferences", {
+          preferences: {
+            model: selectedModel,
+            skills: availableSkills,
+            skipPermissions: skipPermissions,
+          }
+        });
+        console.log("Saved preferences");
+      } catch (err) {
+        console.error("Failed to save preferences:", err);
+      }
+    };
+    savePreferences();
+  }, [selectedModel, skipPermissions, availableSkills]);
 
   // Keep skipPermissionsRef in sync with state AND update backend
   useEffect(() => {
@@ -376,6 +524,98 @@ export const AgentPane = () => {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Notify parent of session changes
+  useEffect(() => {
+    onSessionChange?.(currentSessionId);
+  }, [currentSessionId, onSessionChange]);
+
+  // Handle pending session actions from sidebar
+  useEffect(() => {
+    if (!pendingSessionAction) return;
+
+    const performAction = async () => {
+      setStatus("connecting");
+      setMessages([]);
+
+      try {
+        if (pendingSessionAction.type === "resume" && pendingSessionAction.sessionId) {
+          // Load previous messages from the session file
+          const sessionMessages = await invoke<SessionMessage[]>("load_session_messages", {
+            projectPath: PROJECT_DIR,
+            sessionId: pendingSessionAction.sessionId,
+          });
+
+          // Resume session
+          const newSessionId = await invoke<string>("start_claude_session", {
+            workingDir: PROJECT_DIR,
+            skipPermissions: skipPermissionsRef.current,
+            model: selectedModel,
+            resumeSessionId: pendingSessionAction.sessionId,
+          });
+          setCurrentSessionId(newSessionId);
+          setStatus("connected");
+
+          // Set loaded messages (or show system message if none)
+          if (sessionMessages.length > 0) {
+            const loadedMessages: Message[] = sessionMessages.map((msg) => ({
+              id: msg.id,
+              type: msg.messageType as "user" | "assistant",
+              content: msg.content,
+              timestamp: new Date(),
+              toolsUsed: msg.toolsUsed,
+            }));
+            setMessages(loadedMessages);
+          } else {
+            setMessages([{
+              id: Date.now().toString(),
+              type: "system",
+              content: "Resumed previous session. Context has been restored.",
+              timestamp: new Date(),
+            }]);
+          }
+        } else if (pendingSessionAction.type === "new") {
+          // New session
+          if (currentSessionId) {
+            await invoke("save_session_to_history", { lastMessage: messages[messages.length - 1]?.content || null });
+          }
+          const sessionId = await invoke<string>("start_claude_session", {
+            workingDir: PROJECT_DIR,
+            skipPermissions: skipPermissionsRef.current,
+            model: selectedModel,
+            resumeSessionId: null,
+          });
+          setCurrentSessionId(sessionId);
+          setStatus("connected");
+          // Refresh saved sessions
+          const sessions = await invoke<SavedSession[]>("get_recent_sessions");
+          setSavedSessions(sessions);
+        }
+      } catch (err) {
+        setStatus("error");
+        setError(String(err));
+      }
+    };
+
+    performAction();
+    onPendingSessionActionHandled?.();
+  }, [pendingSessionAction]);
+
+  // Close menus when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('.relative')) {
+        setShowModelMenu(false);
+        setShowResumeMenu(false);
+      }
+    };
+
+    if (showModelMenu || showResumeMenu) {
+      document.addEventListener('click', handleClickOutside);
+      return () => document.removeEventListener('click', handleClickOutside);
+    }
+  }, [showModelMenu, showResumeMenu]);
 
   // Working timer
   useEffect(() => {
@@ -414,14 +654,19 @@ export const AgentPane = () => {
       unlisten = await listen<ClaudeEvent>("claude-event", (event) => {
         const { eventType, content, toolName, isError } = event.payload;
 
-        // Deduplicate events
-        const eventKey = `${eventType}-${content?.slice(0, 50)}-${toolName || ""}`;
-        if (eventType === "result" || eventType === "assistant") {
-          if (processedEventsRef.current.has(eventKey)) {
+        // Debug: log ALL events
+        console.log("📥 EVENT:", eventType, toolName ? `tool=${toolName}` : "", content?.slice(0, 50) || "");
+
+        // Deduplicate result events - SDK may emit multiple "result" events with same content
+        // Don't dedupe "assistant" events as those accumulate content for streaming
+        // Only dedupe "result" events which finalize messages
+        if (eventType === "result" && content) {
+          const contentKey = `result-${content.slice(0, 100)}`;
+          if (processedEventsRef.current.has(contentKey)) {
             return;
           }
-          processedEventsRef.current.add(eventKey);
-          setTimeout(() => processedEventsRef.current.delete(eventKey), 5000);
+          processedEventsRef.current.add(contentKey);
+          setTimeout(() => processedEventsRef.current.delete(contentKey), 5000);
         }
 
         if (eventType === "message_sent") {
@@ -432,18 +677,45 @@ export const AgentPane = () => {
           // Clear turn tracking for new turn
           setCurrentTurnContent("");
           setCurrentTurnTools([]);
+          currentTurnToolsRef.current = []; // Clear ref as well
           return;
         }
 
-        // Handle system init - extract skills and model
+        // Handle service_ready - SDK service has started
+        if (eventType === "service_ready") {
+          console.log("Claude SDK service is ready");
+          return;
+        }
+
+        // Handle ready - SDK service initialized with working directory
+        if (eventType === "ready") {
+          const { model } = event.payload;
+          console.log("Claude ready with model:", model);
+          if (model) {
+            setClaudeModel(model);
+          }
+          return;
+        }
+
+        // Handle system init - extract skills, model, and session ID
         if (eventType === "system_init") {
-          const { skills, model } = event.payload;
-          console.log("Received system_init:", { skills, model });
+          const { skills, model, sessionId } = event.payload;
+          console.log("Received system_init:", { skills, model, sessionId });
           if (skills && skills.length > 0) {
             setAvailableSkills(skills);
           }
           if (model) {
             setClaudeModel(model);
+          }
+          // IMPORTANT: The SDK generates its own session ID which is used for the .jsonl files
+          // We must save THIS ID (not our Rust-generated one) so we can find the session files later
+          if (sessionId) {
+            setCurrentSessionId(sessionId);
+            // Save the SDK's session ID as the active session for this project
+            invoke("set_active_session", {
+              projectPath: PROJECT_DIR,
+              sessionId: sessionId,
+            }).catch(console.error);
           }
           // Cache in Rust backend so it survives HMR
           invoke("set_claude_session_info", { skills: skills || [], model: model || null }).catch(console.error);
@@ -475,28 +747,42 @@ export const AgentPane = () => {
 
         if (eventType === "result") {
           const duration = (Date.now() - responseStartTimeRef.current) / 1000;
+          // Use ONLY the result content - this is the final response
+          // Don't use accumulated assistant content (those are intermediate thoughts between tool calls)
           if (content) {
-            // Capture tools used before clearing (use functional update to access latest state)
-            setCurrentTurnTools((tools) => {
-              setMessages((prev) => [
+            // Capture tools from ref (not state) to avoid React batching issues
+            const toolsUsed = currentTurnToolsRef.current.length > 0
+              ? [...currentTurnToolsRef.current]
+              : undefined;
+
+            console.log("Result event - tools used:", toolsUsed?.length || 0, toolsUsed);
+
+            setMessages((prev) => {
+              // Prevent duplicate messages - check if last message has same content
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg && lastMsg.type === "assistant" && lastMsg.content === content) {
+                console.log("Skipping duplicate assistant message");
+                return prev;
+              }
+              return [
                 ...prev,
                 {
                   id: Date.now().toString(),
                   type: "assistant",
-                  content,
+                  content: content,
                   timestamp: new Date(),
                   duration,
-                  toolsUsed: tools.length > 0 ? [...tools] : undefined,
+                  toolsUsed,
                 },
-              ]);
-              return []; // Clear tools after capturing
+              ];
             });
-          } else {
-            setCurrentTurnTools([]);
           }
+          // Clear tools from both ref and state
+          currentTurnToolsRef.current = [];
+          setCurrentTurnTools([]);
+          setCurrentTurnContent(""); // Clear accumulated content
           setToolCalls([]);
           setCurrentActivity(null);
-          setCurrentTurnContent("");
           setStatus("connected");
           return;
         }
@@ -518,12 +804,11 @@ export const AgentPane = () => {
           return;
         }
 
-        // Track tool calls and current activity
-        if (eventType === "assistant") {
+        // Handle tool_use events (SDK sends these separately)
+        if (eventType === "tool_use") {
           const { toolInput } = event.payload;
-
+          console.log("🔧 TOOL_USE event:", toolName, "ref count:", currentTurnToolsRef.current.length);
           if (toolName) {
-            // This is a tool call
             setCurrentActivity({
               type: "tool",
               toolName,
@@ -533,13 +818,45 @@ export const AgentPane = () => {
               if (prev.includes(toolName)) return prev;
               return [...prev, toolName];
             });
-            // Add to turn tools history
-            setCurrentTurnTools((prev) => [...prev, {
-              name: toolName,
-              input: toolInput || undefined,
-            }]);
+            // Add to turn tools history - use BOTH ref and state
+            // Ref is for reliable capture on result, state is for UI display
+            const toolEntry = { name: toolName, input: toolInput || undefined };
+            currentTurnToolsRef.current = [...currentTurnToolsRef.current, toolEntry];
+            console.log("🔧 Added to ref, new count:", currentTurnToolsRef.current.length);
+            setCurrentTurnTools((prev) => [...prev, toolEntry]);
+          }
+          return;
+        }
+
+        // Handle tool_result events (SDK sends these after tool execution)
+        if (eventType === "tool_result") {
+          // Tool result received - the next event will be assistant or another tool
+          console.log("Tool result received for tool:", event.payload.toolId);
+          return;
+        }
+
+        // Track tool calls and current activity
+        if (eventType === "assistant") {
+          const { toolInput } = event.payload;
+
+          if (toolName) {
+            // This is a tool call (legacy format - keep for backwards compatibility)
+            setCurrentActivity({
+              type: "tool",
+              toolName,
+              toolInput: toolInput || undefined,
+            });
+            setToolCalls((prev) => {
+              if (prev.includes(toolName)) return prev;
+              return [...prev, toolName];
+            });
+            // Add to turn tools history - use BOTH ref and state
+            const toolEntry = { name: toolName, input: toolInput || undefined };
+            currentTurnToolsRef.current = [...currentTurnToolsRef.current, toolEntry];
+            setCurrentTurnTools((prev) => [...prev, toolEntry]);
           } else if (content) {
-            // This is text content - accumulate it
+            // Accumulate text content for display during interruption
+            // (not used for final message - result event has the complete response)
             setCurrentTurnContent((prev) => prev + content);
           }
         }
@@ -547,8 +864,57 @@ export const AgentPane = () => {
 
       setStatus("connecting");
       try {
-        // Always start with permissions enabled - we handle auto-approve client-side
-        await invoke("start_claude_session", { workingDir: PROJECT_DIR, skipPermissions: false });
+        // Load available models
+        const models = await invoke<ModelInfo[]>("get_available_models");
+        setAvailableModels(models);
+
+        // Load saved sessions for resume functionality
+        const sessions = await invoke<SavedSession[]>("get_recent_sessions");
+        setSavedSessions(sessions);
+
+        // Check for active session to resume
+        const activeSessionId = await invoke<string | null>("get_active_session", {
+          projectPath: PROJECT_DIR,
+        });
+
+        // If resuming, set the session ID immediately so it's not overwritten by system_init
+        if (activeSessionId) {
+          setCurrentSessionId(activeSessionId);
+
+          // Load previous messages from the session file
+          try {
+            const sessionMessages = await invoke<SessionMessage[]>("load_session_messages", {
+              projectPath: PROJECT_DIR,
+              sessionId: activeSessionId,
+            });
+
+            if (sessionMessages.length > 0) {
+              // Convert session messages to our Message format
+              const loadedMessages: Message[] = sessionMessages.map((msg) => ({
+                id: msg.id,
+                type: msg.messageType as "user" | "assistant",
+                content: msg.content,
+                timestamp: new Date(),
+                toolsUsed: msg.toolsUsed,
+              }));
+              setMessages(loadedMessages);
+              console.log(`Loaded ${loadedMessages.length} messages from session`);
+            }
+          } catch (err) {
+            console.error("Failed to load session messages:", err);
+          }
+        }
+
+        // Start Claude session with selected model, resuming if we have an active session
+        // Note: The actual session ID from the SDK will be received via system_init event
+        // and saved there. The Rust-generated ID is just internal.
+        await invoke<string>("start_claude_session", {
+          workingDir: PROJECT_DIR,
+          skipPermissions: false,
+          model: selectedModel,
+          resumeSessionId: activeSessionId,
+        });
+
         setStatus("connected");
 
         // Restore cached session info (survives HMR)
@@ -647,6 +1013,127 @@ export const AgentPane = () => {
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
+  };
+
+  // Change model and restart session
+  const handleModelChange = async (modelId: string) => {
+    setSelectedModel(modelId);
+    setShowModelMenu(false);
+
+    // Restart session with new model
+    setStatus("connecting");
+    setMessages([]); // Clear messages for new session
+    try {
+      // Save current session first
+      if (currentSessionId) {
+        await invoke("save_session_to_history", { lastMessage: messages[messages.length - 1]?.content || null });
+      }
+
+      const sessionId = await invoke<string>("start_claude_session", {
+        workingDir: PROJECT_DIR,
+        skipPermissions: skipPermissions,
+        model: modelId,
+        resumeSessionId: null,
+      });
+      setCurrentSessionId(sessionId);
+      setStatus("connected");
+
+      // Refresh saved sessions
+      const sessions = await invoke<SavedSession[]>("get_recent_sessions");
+      setSavedSessions(sessions);
+    } catch (err) {
+      setStatus("error");
+      setError(String(err));
+    }
+  };
+
+  // Resume a previous session
+  const handleResumeSession = async (sessionId: string) => {
+    setShowResumeMenu(false);
+    setStatus("connecting");
+    setMessages([]); // Clear messages first
+
+    try {
+      // Load previous messages from the session file
+      const sessionMessages = await invoke<SessionMessage[]>("load_session_messages", {
+        projectPath: PROJECT_DIR,
+        sessionId: sessionId,
+      });
+
+      const newSessionId = await invoke<string>("start_claude_session", {
+        workingDir: PROJECT_DIR,
+        skipPermissions: skipPermissions,
+        model: selectedModel,
+        resumeSessionId: sessionId,
+      });
+      setCurrentSessionId(newSessionId);
+      setStatus("connected");
+
+      // Set loaded messages (or show system message if none)
+      if (sessionMessages.length > 0) {
+        const loadedMessages: Message[] = sessionMessages.map((msg) => ({
+          id: msg.id,
+          type: msg.messageType as "user" | "assistant",
+          content: msg.content,
+          timestamp: new Date(),
+          toolsUsed: msg.toolsUsed,
+        }));
+        setMessages(loadedMessages);
+        console.log(`Loaded ${loadedMessages.length} messages from resumed session`);
+      } else {
+        setMessages([{
+          id: Date.now().toString(),
+          type: "system",
+          content: "Resumed previous session. Context has been restored.",
+          timestamp: new Date(),
+        }]);
+      }
+    } catch (err) {
+      setStatus("error");
+      setError(String(err));
+    }
+  };
+
+  // Start a new session (clear and restart)
+  const handleNewSession = async () => {
+    setShowResumeMenu(false);
+    setStatus("connecting");
+    setMessages([]);
+
+    try {
+      // Save current session first
+      if (currentSessionId) {
+        await invoke("save_session_to_history", { lastMessage: messages[messages.length - 1]?.content || null });
+      }
+
+      const sessionId = await invoke<string>("start_claude_session", {
+        workingDir: PROJECT_DIR,
+        skipPermissions: skipPermissions,
+        model: selectedModel,
+        resumeSessionId: null,
+      });
+      setCurrentSessionId(sessionId);
+      setStatus("connected");
+
+      // Refresh saved sessions
+      const sessions = await invoke<SavedSession[]>("get_recent_sessions");
+      setSavedSessions(sessions);
+    } catch (err) {
+      setStatus("error");
+      setError(String(err));
+    }
+  };
+
+  // Format timestamp for display
+  const formatSessionTime = (timestamp: number) => {
+    const date = new Date(timestamp * 1000);
+    const now = new Date();
+    const diff = now.getTime() - date.getTime();
+
+    if (diff < 60000) return "Just now";
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+    return date.toLocaleDateString();
   };
 
   return (
@@ -795,6 +1282,13 @@ export const AgentPane = () => {
                   {msg.content}
                 </div>
               )}
+
+              {msg.type === "system" && (
+                <div className="flex items-center gap-2 text-text-tertiary text-sm">
+                  <span className="text-accent">→</span>
+                  <span>{msg.content}</span>
+                </div>
+              )}
             </div>
           ))}
 
@@ -875,18 +1369,21 @@ export const AgentPane = () => {
               {/* Tool call history */}
               {toolCalls.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 mt-2">
-                  {toolCalls.map((tool, i) => (
-                    <span
-                      key={i}
-                      className={`px-2 py-0.5 rounded text-xs ${
-                        tool === currentActivity?.toolName
-                          ? "bg-success/20 text-success"
-                          : "bg-surface-overlay text-text-tertiary"
-                      }`}
-                    >
-                      {tool}
-                    </span>
-                  ))}
+                  {toolCalls.map((tool, i) => {
+                    const displayName = normalizeToolName(tool);
+                    return (
+                      <span
+                        key={i}
+                        className={`px-2 py-0.5 rounded text-xs ${
+                          tool === currentActivity?.toolName
+                            ? "bg-success/20 text-success"
+                            : "bg-surface-overlay text-text-tertiary"
+                        }`}
+                      >
+                        {displayName}
+                      </span>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -978,7 +1475,7 @@ export const AgentPane = () => {
       <div className="border-t border-border-subtle bg-surface-base">
         <div className="max-w-3xl mx-auto p-4">
           <form onSubmit={handleSubmit}>
-            <div className="bg-surface-raised border border-border rounded-xl overflow-hidden">
+            <div className="bg-surface-raised border border-border rounded-xl">
               <textarea
                 ref={inputRef}
                 value={input}
@@ -992,13 +1489,104 @@ export const AgentPane = () => {
               />
               <div className="flex items-center justify-between px-3 py-2 border-t border-border-subtle">
                 <div className="flex items-center gap-2">
-                  {/* Model indicator */}
-                  <div
-                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-surface-overlay text-text-secondary text-xs"
-                    title={claudeModel || "Claude model"}
-                  >
-                    <span className="text-accent">✳</span>
-                    <span>{claudeModel ? claudeModel.replace("claude-", "").replace("-20251101", "") : "Claude"}</span>
+                  {/* Model selector dropdown */}
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowModelMenu(!showModelMenu);
+                        setShowResumeMenu(false);
+                      }}
+                      className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-surface-overlay hover:bg-hover text-text-secondary text-xs transition-colors"
+                      title="Click to change model"
+                    >
+                      <span className="text-accent">✳</span>
+                      <span className="capitalize">{selectedModel}</span>
+                      <svg className="w-3 h-3 text-text-tertiary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </button>
+                    {showModelMenu && (
+                      <div className="absolute bottom-full left-0 mb-1 bg-surface-raised border border-border rounded-lg shadow-xl py-1 min-w-[180px] z-50">
+                        {availableModels.map((model) => (
+                          <button
+                            key={model.id}
+                            onClick={() => handleModelChange(model.id)}
+                            className={`w-full px-3 py-2 text-left text-xs hover:bg-hover transition-colors ${
+                              selectedModel === model.id ? "text-accent" : "text-text-primary"
+                            }`}
+                          >
+                            <div className="flex items-center gap-2">
+                              {selectedModel === model.id && <span>✓</span>}
+                              <div className={selectedModel === model.id ? "" : "ml-4"}>
+                                <div className="font-medium">{model.name}</div>
+                                <div className="text-text-tertiary text-[10px]">{model.description}</div>
+                              </div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Resume/New Session button */}
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowResumeMenu(!showResumeMenu);
+                        setShowModelMenu(false);
+                      }}
+                      className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-surface-overlay hover:bg-hover text-text-secondary text-xs transition-colors"
+                      title="New session or resume previous"
+                    >
+                      <span>↻</span>
+                      <span>Session</span>
+                    </button>
+                    {showResumeMenu && (
+                      <div className="absolute bottom-full left-0 mb-1 bg-surface-raised border border-border rounded-lg shadow-xl py-1 min-w-[220px] z-50">
+                        <button
+                          onClick={handleNewSession}
+                          className="w-full px-3 py-2 text-left text-xs text-text-primary hover:bg-hover transition-colors border-b border-border-subtle"
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="text-success">+</span>
+                            <span className="font-medium">New Session</span>
+                          </div>
+                        </button>
+                        {savedSessions.length > 0 && (
+                          <>
+                            <div className="px-3 py-1.5 text-[10px] text-text-tertiary uppercase tracking-wide">
+                              Resume Previous
+                            </div>
+                            {savedSessions.slice(0, 5).map((session) => (
+                              <button
+                                key={session.sessionId}
+                                onClick={() => handleResumeSession(session.sessionId)}
+                                className="w-full px-3 py-2 text-left text-xs text-text-primary hover:bg-hover transition-colors"
+                              >
+                                <div className="flex items-center justify-between">
+                                  <div className="flex-1 min-w-0">
+                                    <div className="truncate text-text-secondary">
+                                      {session.lastMessagePreview || "No preview"}
+                                    </div>
+                                    <div className="flex items-center gap-2 text-[10px] text-text-tertiary">
+                                      <span>{formatSessionTime(session.createdAt)}</span>
+                                      {session.model && <span>• {session.model}</span>}
+                                    </div>
+                                  </div>
+                                </div>
+                              </button>
+                            ))}
+                          </>
+                        )}
+                        {savedSessions.length === 0 && (
+                          <div className="px-3 py-2 text-xs text-text-tertiary">
+                            No previous sessions
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                   {/* Skills indicator button */}
                   <button

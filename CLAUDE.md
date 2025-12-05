@@ -22,32 +22,62 @@ Think "Cursor for iOS" but with the agent being truly self-reliant.
 | Frontend | React + TypeScript |
 | Styling | Tailwind CSS |
 | Components | shadcn/ui |
-| iOS Bridge | Swift CLI + dylib |
-| Agent | Claude Code (subprocess) |
+| iOS Bridge | Swift CLI (nocur-swift) |
+| Agent | Claude Agent SDK (Node.js service) |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│              Nocur (Tauri App)                  │
-├─────────────────────────────────────────────────┤
-│  Frontend: React + shadcn/ui + Tailwind        │
-│  Backend:  Rust (Tauri commands)               │
-├─────────────────────────────────────────────────┤
-│          │              │                       │
-│          ▼              ▼                       │
-│  ┌──────────────┐  ┌──────────────────┐        │
-│  │ Claude Code  │  │ Swift CLI        │        │
-│  │ (subprocess) │  │ (nocur-swift)    │        │
-│  └──────────────┘  └──────────────────┘        │
-│                          │                      │
-│                          ▼                      │
-│                    ┌───────────┐               │
-│                    │ iOS Sim   │               │
-│                    │ + Xcode   │               │
-│                    └───────────┘               │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                   Nocur (Tauri App)                     │
+├─────────────────────────────────────────────────────────┤
+│  Frontend: React + shadcn/ui + Tailwind                 │
+│  Backend:  Rust (Tauri commands)                        │
+├─────────────────────────────────────────────────────────┤
+│                         │                               │
+│                         ▼                               │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │            claude-service (Node.js)              │  │
+│  │  ┌─────────────────┐  ┌───────────────────────┐  │  │
+│  │  │ Claude Agent SDK│  │ MCP Server            │  │  │
+│  │  │ @anthropic-ai/  │  │ (nocur-swift tools)   │  │  │
+│  │  │ claude-agent-sdk│  │ - sim_screenshot      │  │  │
+│  │  └────────┬────────┘  │ - ui_interact         │  │  │
+│  │           │           │ - app_build           │  │  │
+│  │           ▼           │ - ...                 │  │  │
+│  │     Anthropic API     └───────────┬───────────┘  │  │
+│  └───────────────────────────────────┼──────────────┘  │
+│                                      │                  │
+│                                      ▼                  │
+│                          ┌──────────────────┐          │
+│                          │ nocur-swift CLI  │          │
+│                          └────────┬─────────┘          │
+│                                   │                     │
+│                                   ▼                     │
+│                          ┌──────────────────┐          │
+│                          │ iOS Simulator    │          │
+│                          │ + Xcode          │          │
+│                          └──────────────────┘          │
+└─────────────────────────────────────────────────────────┘
 ```
+
+### Communication Flow
+
+1. **Tauri → claude-service**: JSON commands over stdin
+   - `{"type": "start", "workingDir": "...", "model": "sonnet"}`
+   - `{"type": "message", "content": "..."}`
+   - `{"type": "interrupt"}`, `{"type": "changeModel", "model": "opus"}`, `{"type": "stop"}`
+
+2. **claude-service → Tauri**: JSON events over stdout
+   - `{"type": "service_ready"}` - Service initialized
+   - `{"type": "ready", "model": "sonnet"}` - Ready for messages
+   - `{"type": "assistant", "content": "..."}` - Text response
+   - `{"type": "tool_use", "toolName": "...", "toolInput": "..."}` - Tool invocation
+   - `{"type": "result", "content": "...", "usage": {...}}` - Query complete
+
+3. **claude-service → nocur-swift**: MCP tool calls
+   - Tools like `sim_screenshot`, `ui_interact`, `app_build` are exposed as MCP tools
+   - The SDK calls these tools automatically when Claude requests them
 
 ## Project Structure
 
@@ -57,11 +87,17 @@ nocur/
 ├── src-tauri/                # Rust backend (Tauri)
 │   ├── src/
 │   │   ├── main.rs
-│   │   ├── lib.rs
-│   │   ├── claude/           # Claude Code subprocess management
-│   │   ├── simulator/        # iOS Simulator control
-│   │   └── project/          # Xcode project detection
+│   │   ├── lib.rs            # Tauri commands
+│   │   ├── claude.rs         # Claude SDK service management
+│   │   ├── permissions.rs    # Permission handling
+│   │   └── window_capture.rs # Simulator window capture
 │   └── Cargo.toml
+│
+├── claude-service/           # Node.js Claude Agent SDK service
+│   ├── package.json          # @anthropic-ai/claude-agent-sdk
+│   ├── tsconfig.json
+│   └── src/
+│       └── index.ts          # SDK service with MCP tools
 │
 ├── src/                      # React frontend
 │   ├── App.tsx
@@ -72,10 +108,9 @@ nocur/
 │   │   │   ├── SimulatorPane.tsx
 │   │   │   ├── AgentPane.tsx
 │   │   │   └── ProjectPane.tsx
-│   │   └── layout/
+│   │   └── SkillsModal.tsx
 │   ├── hooks/
 │   ├── lib/
-│   │   ├── tauri.ts          # Tauri command bindings
 │   │   └── utils.ts
 │   └── styles/
 │
@@ -85,14 +120,8 @@ nocur/
 │       ├── CLI/              # Command-line interface
 │       └── Core/             # Shared iOS tooling logic
 │
-├── nocur-dylib/              # Debug dylib injected into iOS apps
-│   ├── Package.swift
-│   └── Sources/
-│
-└── docs/
-    ├── ARCHITECTURE.md
-    ├── AGENT_GUIDE.md        # How AI agents should use nocur
-    └── COMMANDS.md           # CLI reference
+└── sample-app/               # Test iOS app for development
+    └── NocurTestApp/
 ```
 
 ## Coding Guidelines
@@ -270,8 +299,9 @@ All colors are defined in `src/styles/globals.css` using the `@theme` directive.
 ### Development
 
 ```bash
-# Install dependencies
+# Install dependencies (frontend + claude-service)
 pnpm install
+cd claude-service && pnpm install && pnpm build && cd ..
 
 # Run in development
 pnpm tauri dev
@@ -279,9 +309,29 @@ pnpm tauri dev
 # Build for production
 pnpm tauri build
 
+# Build claude-service separately
+cd claude-service && pnpm build
+
 # Run Swift CLI separately
 cd nocur-swift && swift run nocur-swift --help
 ```
+
+### Claude Service
+
+The claude-service is a Node.js process that wraps the Claude Agent SDK. It must be built before running the app:
+
+```bash
+cd claude-service
+pnpm install    # Install @anthropic-ai/claude-agent-sdk
+pnpm build      # Compile TypeScript to dist/
+```
+
+The service exposes these MCP tools to Claude:
+- `sim_screenshot` - Take iOS simulator screenshot
+- `sim_list`, `sim_boot` - Manage simulators
+- `ui_interact` - Tap, type, scroll with screenshot
+- `ui_hierarchy`, `ui_find` - View hierarchy inspection
+- `app_build`, `app_launch`, `app_kill` - Xcode project lifecycle
 
 ### Swift CLI (nocur-swift)
 
@@ -297,35 +347,37 @@ nocur-swift ui tap <x> <y>        # Tap at coordinates
 
 ## Implementation Phases
 
-### Phase 1: Scaffold (Current)
-- [ ] Tauri + React + shadcn/ui setup
-- [ ] Three-pane layout shell
-- [ ] Basic routing/state
+### Phase 1: Scaffold ✅
+- [x] Tauri + React + shadcn/ui setup
+- [x] Three-pane layout shell
+- [x] Basic routing/state
 
-### Phase 2: Simulator Integration
-- [ ] Swift CLI: sim list/boot/screenshot
-- [ ] Display screenshots in Simulator pane
-- [ ] Live simulator mirroring
+### Phase 2: Simulator Integration ✅
+- [x] Swift CLI: sim list/boot/screenshot
+- [x] Display screenshots in Simulator pane
+- [x] Live simulator mirroring (window capture)
 
-### Phase 3: App Lifecycle
-- [ ] Project auto-detection
-- [ ] Build/install/launch/kill
-- [ ] Build output streaming
+### Phase 3: App Lifecycle ✅
+- [x] Project auto-detection
+- [x] Build/install/launch/kill
+- [x] Build output streaming
 
-### Phase 4: View Introspection
-- [ ] Debug dylib for hierarchy capture
-- [ ] Hierarchy visualization in UI
-- [ ] Overlay on simulator view
+### Phase 4: View Introspection ✅
+- [x] UI hierarchy via accessibility APIs
+- [x] Find elements by text/type/ID
+- [x] Compound ui_interact command
 
-### Phase 5: Agent Integration
-- [ ] Claude Code subprocess management
-- [ ] Tool injection
-- [ ] Agent output parsing and display
+### Phase 5: Agent Integration ✅
+- [x] Claude Agent SDK integration (replaces CLI subprocess)
+- [x] MCP tools for nocur-swift commands
+- [x] Model selection (sonnet/opus/haiku)
+- [x] Session resume capability
+- [x] Agent output streaming and display
 
-### Phase 6: Interaction
-- [ ] Tap/scroll/type via CLI
-- [ ] Agent-driven UI testing
-- [ ] Verification workflows
+### Phase 6: Interaction ✅
+- [x] Tap/scroll/type via CLI
+- [x] Agent-driven UI testing
+- [x] Verification workflows (screenshot after action)
 
 ## Notes for AI Agents
 
@@ -343,3 +395,5 @@ When working on this codebase:
 - [shadcn/ui](https://ui.shadcn.com/)
 - [simctl docs](https://nshipster.com/simctl/)
 - [Swift ArgumentParser](https://github.com/apple/swift-argument-parser)
+- [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)
+- [Claude Agent SDK Docs](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/sdk)

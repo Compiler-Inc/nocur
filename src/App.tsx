@@ -3,7 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { SimulatorPane } from "@/components/panes/SimulatorPane";
 import { AgentPane } from "@/components/panes/AgentPane";
+import { DevToolsPane } from "@/components/panes/DevToolsPane";
+import { DiffViewer } from "@/components/DiffViewer";
 import { Onboarding } from "@/components/Onboarding";
+import { HistorySidebar } from "@/components/HistorySidebar";
+import { OpenInDropdown } from "@/components/OpenInDropdown";
 
 // DEBUG: Set to true to always show onboarding
 const DEBUG_SHOW_ONBOARDING = false;
@@ -59,6 +63,7 @@ interface GitInfo {
 
 const PROJECT_PATH = "<REPO_ROOT>/sample-app";
 const PROJECT_SCHEME = "NocurTestApp";
+const ROOT_PROJECT_PATH = "<REPO_ROOT>";
 
 // Resizable divider component
 const ResizeHandle = ({
@@ -115,8 +120,19 @@ const App = () => {
   const [isReady, setIsReady] = useState<boolean | null>(DEBUG_SHOW_ONBOARDING ? false : null);
   const [showOnboarding, setShowOnboarding] = useState(true);
 
-  // Pane width (simulator)
-  const [rightWidth, setRightWidth] = useState(340);
+  // Pane widths - balanced like Conductor
+  const [leftWidth, setLeftWidth] = useState(300);
+  const [rightWidth, setRightWidth] = useState(280);
+
+  // Session state (shared with sidebar)
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [pendingSessionAction, setPendingSessionAction] = useState<{ type: "resume" | "new"; sessionId?: string } | null>(null);
+  const [indexedSessions, setIndexedSessions] = useState<string[]>([]); // For Cmd+1,2,3
+
+  // Dev tools panel state
+  const [showDevTools, setShowDevTools] = useState(false);
+  const [devToolsWidth, setDevToolsWidth] = useState(320);
+  const [selectedDiffFile, setSelectedDiffFile] = useState<string | null>(null);
 
   // Build state
   const [buildStatus, setBuildStatus] = useState<BuildStatus>("idle");
@@ -217,9 +233,76 @@ const App = () => {
     setIsReady(true);
   };
 
-  const handleRightResize = useCallback((delta: number) => {
-    setRightWidth((w) => Math.max(280, Math.min(500, w + delta)));
+  const handleLeftResize = useCallback((delta: number) => {
+    setLeftWidth((w) => Math.max(220, Math.min(360, w + delta)));
   }, []);
+
+  const handleRightResize = useCallback((delta: number) => {
+    setRightWidth((w) => Math.max(240, Math.min(360, w + delta)));
+  }, []);
+
+  // Session action handlers for sidebar
+  const handleSelectSession = useCallback((sessionId: string) => {
+    setPendingSessionAction({ type: "resume", sessionId });
+  }, []);
+
+  const handleNewSession = useCallback(() => {
+    setPendingSessionAction({ type: "new" });
+  }, []);
+
+  const handleDevToolsResize = useCallback((delta: number) => {
+    setDevToolsWidth((w) => Math.max(280, Math.min(600, w - delta)));
+  }, []);
+
+  // Load indexed sessions for Cmd+1,2,3
+  useEffect(() => {
+    const loadSessions = async () => {
+      try {
+        const sessions = await invoke<{ sessionId: string }[]>("get_recent_sessions");
+        // Include current session first, then recent sessions
+        const sessionIds = sessions.map(s => s.sessionId);
+        if (currentSessionId && !sessionIds.includes(currentSessionId)) {
+          sessionIds.unshift(currentSessionId);
+        }
+        setIndexedSessions(sessionIds.slice(0, 9)); // Max 9 for Cmd+1-9
+      } catch (err) {
+        console.error("Failed to load sessions:", err);
+      }
+    };
+    loadSessions();
+  }, [currentSessionId]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Cmd+1-9: Switch sessions
+      if (e.metaKey && e.key >= "1" && e.key <= "9") {
+        const index = parseInt(e.key) - 1;
+        if (indexedSessions[index] && indexedSessions[index] !== currentSessionId) {
+          e.preventDefault();
+          setPendingSessionAction({ type: "resume", sessionId: indexedSessions[index] });
+        }
+      }
+      // Cmd+Shift+E: Toggle dev tools
+      if (e.metaKey && e.shiftKey && e.key === "e") {
+        e.preventDefault();
+        setShowDevTools(prev => !prev);
+      }
+      // Cmd+Shift+G: Toggle dev tools (git)
+      if (e.metaKey && e.shiftKey && e.key === "g") {
+        e.preventDefault();
+        setShowDevTools(prev => !prev);
+      }
+      // Escape: Close diff viewer
+      if (e.key === "Escape" && selectedDiffFile) {
+        e.preventDefault();
+        setSelectedDiffFile(null);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [indexedSessions, currentSessionId, selectedDiffFile]);
 
   // Build handlers
   const handleBuild = async () => {
@@ -359,6 +442,7 @@ const App = () => {
                 </span>
               </>
             )}
+            <OpenInDropdown projectPath={PROJECT_PATH} />
           </div>
         </div>
 
@@ -398,11 +482,38 @@ const App = () => {
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Two Panes: Agent + Simulator */}
+        {/* Three Panes: History + Agent + Simulator */}
         <div className="flex flex-1 overflow-hidden">
-          {/* Main Pane: Claude Agent */}
+          {/* Left Pane: History Sidebar */}
+          <div
+            style={{ width: leftWidth }}
+            className="flex flex-col shrink-0 overflow-hidden"
+          >
+            <HistorySidebar
+              currentSessionId={currentSessionId}
+              onSelectSession={handleSelectSession}
+              onNewSession={handleNewSession}
+              projectPath={PROJECT_PATH}
+            />
+          </div>
+
+          <ResizeHandle onResize={handleLeftResize} direction="left" />
+
+          {/* Main Pane: Claude Agent or Diff Viewer */}
           <div className="flex-1 min-w-[400px] flex flex-col overflow-hidden bg-surface-base">
-            <AgentPane />
+            {selectedDiffFile ? (
+              <DiffViewer
+                filePath={selectedDiffFile}
+                projectPath={ROOT_PROJECT_PATH}
+                onClose={() => setSelectedDiffFile(null)}
+              />
+            ) : (
+              <AgentPane
+                onSessionChange={setCurrentSessionId}
+                pendingSessionAction={pendingSessionAction}
+                onPendingSessionActionHandled={() => setPendingSessionAction(null)}
+              />
+            )}
           </div>
 
           <ResizeHandle onResize={handleRightResize} direction="right" />
@@ -414,6 +525,24 @@ const App = () => {
           >
             <SimulatorPane />
           </div>
+
+          {/* Dev Tools Pane - Version Control + Terminal */}
+          {showDevTools && (
+            <>
+              <ResizeHandle onResize={handleDevToolsResize} direction="right" />
+              <div
+                style={{ width: devToolsWidth }}
+                className="flex flex-col shrink-0 overflow-hidden"
+              >
+                <DevToolsPane
+                  projectPath={ROOT_PROJECT_PATH}
+                  onClose={() => setShowDevTools(false)}
+                  onFileSelect={setSelectedDiffFile}
+                  selectedFile={selectedDiffFile}
+                />
+              </div>
+            </>
+          )}
         </div>
 
         {/* Bottom Build Panel - collapsible & resizable */}
