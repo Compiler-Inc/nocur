@@ -9,6 +9,7 @@ import { DiffViewer } from "@/components/DiffViewer";
 import { Onboarding } from "@/components/Onboarding";
 import { OpenInDropdown } from "@/components/OpenInDropdown";
 import { ContextReviewModal, RecordingData } from "@/components/ContextReviewModal";
+import { BottomPanel } from "@/components/BottomPanel";
 
 // DEBUG: Set to true to always show onboarding
 const DEBUG_SHOW_ONBOARDING = false;
@@ -144,19 +145,10 @@ const App = () => {
   // Git info
   const [gitInfo, setGitInfo] = useState<GitInfo | null>(null);
 
-  // Build logs panel state
-  const [showBuildPanel, setShowBuildPanel] = useState(false);
+  // Bottom panel state (terminal + build logs)
+  const [showBottomPanel, setShowBottomPanel] = useState(false);
   const [buildLogs, setBuildLogs] = useState<LogEntry[]>([]);
-  const [buildPanelHeight, setBuildPanelHeight] = useState(180);
-  const logsEndRef = useRef<HTMLDivElement>(null);
-  const panelResizing = useRef(false);
-  const panelStartY = useRef(0);
-  const panelStartHeight = useRef(0);
-
-  // Auto-scroll logs
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [buildLogs]);
+  const [bottomPanelHeight, setBottomPanelHeight] = useState(220);
 
   // Fetch git info
   useEffect(() => {
@@ -195,7 +187,7 @@ const App = () => {
         // Auto-show panel when build starts
         if (eventType === "started") {
           setBuildLogs([{ type: "info", message, timestamp: new Date() }]);
-          setShowBuildPanel(true);
+          setShowBottomPanel(true);
         }
       });
     };
@@ -247,21 +239,31 @@ const App = () => {
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Cmd+`: Toggle terminal (like VSCode)
+      if (e.metaKey && e.key === "`") {
+        e.preventDefault();
+        setShowBottomPanel(prev => !prev);
+      }
       // Cmd+Shift+E: Toggle dev tools
       if (e.metaKey && e.shiftKey && e.key === "e") {
         e.preventDefault();
         setShowDevTools(prev => !prev);
       }
-      // Escape: Close diff viewer
-      if (e.key === "Escape" && selectedDiffFile) {
-        e.preventDefault();
-        setSelectedDiffFile(null);
+      // Escape: Close diff viewer or bottom panel
+      if (e.key === "Escape") {
+        if (selectedDiffFile) {
+          e.preventDefault();
+          setSelectedDiffFile(null);
+        } else if (showBottomPanel) {
+          e.preventDefault();
+          setShowBottomPanel(false);
+        }
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedDiffFile]);
+  }, [selectedDiffFile, showBottomPanel]);
 
   // Build handlers
   const handleBuild = async () => {
@@ -315,47 +317,6 @@ const App = () => {
     building: { color: "bg-warning animate-pulse", text: "Building..." },
     success: { color: "bg-success", text: buildTime ? `${buildTime.toFixed(1)}s` : "Done" },
     failed: { color: "bg-error", text: "Failed" },
-  };
-
-  // Panel resize handlers
-  useEffect(() => {
-    const handlePanelMouseMove = (e: MouseEvent) => {
-      if (!panelResizing.current) return;
-      const delta = panelStartY.current - e.clientY;
-      const newHeight = Math.max(100, Math.min(400, panelStartHeight.current + delta));
-      setBuildPanelHeight(newHeight);
-    };
-
-    const handlePanelMouseUp = () => {
-      panelResizing.current = false;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-
-    document.addEventListener("mousemove", handlePanelMouseMove);
-    document.addEventListener("mouseup", handlePanelMouseUp);
-
-    return () => {
-      document.removeEventListener("mousemove", handlePanelMouseMove);
-      document.removeEventListener("mouseup", handlePanelMouseUp);
-    };
-  }, []);
-
-  const handlePanelResizeStart = (e: React.MouseEvent) => {
-    panelResizing.current = true;
-    panelStartY.current = e.clientY;
-    panelStartHeight.current = buildPanelHeight;
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-  };
-
-  const getLogColor = (type: LogEntry["type"]) => {
-    switch (type) {
-      case "error": return "text-error";
-      case "warning": return "text-warning";
-      case "success": return "text-success";
-      default: return "text-text-secondary";
-    }
   };
 
   // Handle sending context from review modal
@@ -608,56 +569,16 @@ const App = () => {
           )}
         </div>
 
-        {/* Bottom Build Panel - collapsible & resizable */}
-        {showBuildPanel && (
-          <div className="bg-surface-raised flex flex-col shrink-0" style={{ height: buildPanelHeight }}>
-            {/* Resize Handle */}
-            <div
-              onMouseDown={handlePanelResizeStart}
-              className="h-1 bg-border hover:bg-accent/50 cursor-row-resize transition-colors shrink-0"
-            />
-            {/* Panel Header */}
-            <div className="h-8 px-3 flex items-center justify-between border-b border-border-subtle bg-surface-raised shrink-0">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-medium text-text-primary">Build Output</span>
-                <span className="text-xs text-text-tertiary">({buildLogs.length})</span>
-              </div>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => setBuildLogs([])}
-                  className="p-1 rounded hover:bg-hover text-text-tertiary hover:text-text-secondary transition-colors"
-                  title="Clear"
-                >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeWidth="2" strokeLinecap="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                  </svg>
-                </button>
-                <button
-                  onClick={() => setShowBuildPanel(false)}
-                  className="p-1 rounded hover:bg-hover text-text-tertiary hover:text-text-secondary transition-colors"
-                  title="Close"
-                >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeWidth="2" strokeLinecap="round" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-
-            {/* Log Content */}
-            <div className="flex-1 overflow-auto p-2 font-mono text-[11px]">
-              {buildLogs.map((log, i) => (
-                <div key={i} className={`${getLogColor(log.type)} leading-relaxed`}>
-                  <span className="text-text-tertiary opacity-50">
-                    {log.timestamp.toLocaleTimeString("en-US", { hour12: false })}
-                  </span>
-                  {" "}
-                  {log.message}
-                </div>
-              ))}
-              <div ref={logsEndRef} />
-            </div>
-          </div>
+        {/* Bottom Panel - Terminal + Build Logs */}
+        {showBottomPanel && (
+          <BottomPanel
+            height={bottomPanelHeight}
+            onHeightChange={setBottomPanelHeight}
+            onClose={() => setShowBottomPanel(false)}
+            buildLogs={buildLogs}
+            onClearBuildLogs={() => setBuildLogs([])}
+            projectPath={PROJECT_PATH}
+          />
         )}
       </div>
 

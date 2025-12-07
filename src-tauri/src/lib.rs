@@ -2533,6 +2533,122 @@ fn extract_stack_trace(content: &str) -> Option<String> {
     }
 }
 
+/// List project files for @ file reference autocomplete
+/// Uses the `ignore` crate to respect .gitignore
+#[tauri::command]
+async fn list_project_files(
+    project_path: String,
+    query: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    use ignore::WalkBuilder;
+
+    let limit = limit.unwrap_or(50);
+    let query = query.unwrap_or_default().to_lowercase();
+
+    let mut files: Vec<String> = Vec::new();
+
+    let walker = WalkBuilder::new(&project_path)
+        .hidden(false)  // Don't skip hidden files
+        .git_ignore(true)  // Respect .gitignore
+        .git_global(true)  // Respect global .gitignore
+        .git_exclude(true)  // Respect .git/info/exclude
+        .max_depth(Some(10))  // Limit depth
+        .build();
+
+    for entry in walker {
+        if files.len() >= limit * 2 {  // Collect more to filter better
+            break;
+        }
+
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Skip directories
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+            continue;
+        }
+
+        let path = entry.path();
+
+        // Get relative path from project root
+        let relative_path = path.strip_prefix(&project_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        // Skip if path starts with .git/
+        if relative_path.starts_with(".git/") || relative_path.starts_with(".git\\") {
+            continue;
+        }
+
+        files.push(relative_path);
+    }
+
+    // Sort and filter by query
+    if !query.is_empty() {
+        // Score each file by how well it matches the query
+        let mut scored: Vec<(String, i32)> = files
+            .into_iter()
+            .filter_map(|f| {
+                let lower = f.to_lowercase();
+                let filename = f.split('/').last().unwrap_or(&f).to_lowercase();
+
+                // Calculate match score
+                let score = if filename == query {
+                    100  // Exact filename match
+                } else if filename.starts_with(&query) {
+                    80  // Filename starts with query
+                } else if filename.contains(&query) {
+                    60  // Filename contains query
+                } else if lower.contains(&query) {
+                    40  // Path contains query
+                } else {
+                    return None;  // No match
+                };
+
+                Some((f, score))
+            })
+            .collect();
+
+        // Sort by score (descending), then alphabetically
+        scored.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+        });
+
+        files = scored.into_iter().map(|(f, _)| f).take(limit).collect();
+    } else {
+        // No query - sort by recency (we don't have mtime, so just alphabetically)
+        files.sort();
+        files.truncate(limit);
+    }
+
+    Ok(files)
+}
+
+/// Write debug snapshot to file for agentic access
+#[tauri::command]
+async fn write_debug_snapshot(snapshot: String) -> Result<(), String> {
+    let debug_path = std::path::Path::new("/tmp/nocur-debug.json");
+    fs::write(debug_path, &snapshot)
+        .map_err(|e| format!("Failed to write debug snapshot: {}", e))?;
+    Ok(())
+}
+
+/// Read debug snapshot from file
+#[tauri::command]
+async fn read_debug_snapshot() -> Result<String, String> {
+    let debug_path = std::path::Path::new("/tmp/nocur-debug.json");
+    if debug_path.exists() {
+        fs::read_to_string(debug_path)
+            .map_err(|e| format!("Failed to read debug snapshot: {}", e))
+    } else {
+        Ok("{}".to_string())
+    }
+}
+
 /// Save base64 screenshots to temp files and return their paths
 #[tauri::command]
 async fn save_screenshots_to_temp(
@@ -2575,6 +2691,32 @@ async fn save_screenshots_to_temp(
     }
 
     Ok(paths)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+#[tauri::command]
+async fn run_terminal_command(command: String, working_dir: String) -> Result<TerminalResult, String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .current_dir(&working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to execute command: {}", e))?;
+
+    Ok(TerminalResult {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2656,6 +2798,8 @@ pub fn run() {
             get_session_names,
             get_active_session,
             set_active_session,
+            // Terminal
+            run_terminal_command,
             // Window capture (macOS only)
             #[cfg(target_os = "macos")]
             start_simulator_stream,
@@ -2684,6 +2828,11 @@ pub fn run() {
             get_crash_reports,
             // Screenshot saving
             save_screenshots_to_temp,
+            // Debug utilities
+            write_debug_snapshot,
+            read_debug_snapshot,
+            // File autocomplete
+            list_project_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
