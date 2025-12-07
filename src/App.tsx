@@ -236,34 +236,46 @@ const App = () => {
     setDevToolsWidth((w) => Math.max(280, Math.min(600, w - delta)));
   }, []);
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts (VSCode/Cursor style)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Cmd+`: Toggle terminal (like VSCode)
+      // Cmd+J: Toggle bottom panel (VSCode style)
+      if (e.metaKey && !e.shiftKey && e.key === "j") {
+        e.preventDefault();
+        setShowBottomPanel(prev => !prev);
+      }
+      // Cmd+`: Toggle terminal (alternative)
       if (e.metaKey && e.key === "`") {
         e.preventDefault();
         setShowBottomPanel(prev => !prev);
       }
-      // Cmd+Shift+E: Toggle dev tools
+      // Cmd+B: Toggle right sidebar (simulator)
+      if (e.metaKey && !e.shiftKey && e.key === "b") {
+        e.preventDefault();
+        setRightCollapsed(prev => !prev);
+      }
+      // Cmd+Shift+E: Toggle dev tools (source control)
       if (e.metaKey && e.shiftKey && e.key === "e") {
         e.preventDefault();
         setShowDevTools(prev => !prev);
       }
-      // Escape: Close diff viewer or bottom panel
+      // Cmd+Shift+G: Toggle dev tools (git - same as E)
+      if (e.metaKey && e.shiftKey && e.key === "g") {
+        e.preventDefault();
+        setShowDevTools(prev => !prev);
+      }
+      // Escape: Close panels/modals
       if (e.key === "Escape") {
         if (selectedDiffFile) {
           e.preventDefault();
           setSelectedDiffFile(null);
-        } else if (showBottomPanel) {
-          e.preventDefault();
-          setShowBottomPanel(false);
         }
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedDiffFile, showBottomPanel]);
+  }, [selectedDiffFile]);
 
   // Build handlers
   const handleBuild = async () => {
