@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { SkillsModal } from "../SkillsModal";
+import { ChatContextModal } from "../ChatContextModal";
 
 interface ClaudeEvent {
   eventType: string;
@@ -25,6 +26,8 @@ interface ClaudeEvent {
   cost?: number;
   duration?: number;
   numTurns?: number;
+  // Result subtype (e.g., "error_max_turns", "end_turn")
+  resultSubtype?: string;
 }
 
 interface Message {
@@ -36,7 +39,15 @@ interface Message {
   timestamp: Date;
   duration?: number;
   // Tools used during this response turn
-  toolsUsed?: Array<{ name: string; input?: string }>;
+  toolsUsed?: Array<{ name: string; input?: string; result?: string; toolId?: string }>;
+  // Token usage for this message
+  outputTokens?: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  // Whether this response was truncated due to max turns
+  hitMaxTurns?: boolean;
+  numTurns?: number;
 }
 
 interface PermissionRequest {
@@ -80,6 +91,339 @@ interface SessionMessage {
 }
 
 const PROJECT_DIR = "<REPO_ROOT>"; // TODO: Make dynamic
+
+// Memoized ReactMarkdown components to avoid re-creating on every render
+const MARKDOWN_COMPONENTS = {
+  code({ className, children, ...props }: { className?: string; children?: React.ReactNode }) {
+    const isInline = !className;
+    if (isInline) {
+      return (
+        <code className="px-1.5 py-0.5 bg-surface-overlay rounded text-accent-muted font-mono text-[13px]" {...props}>
+          {children}
+        </code>
+      );
+    }
+    return (
+      <code className="block bg-surface-sunken rounded-lg p-3 font-mono text-[13px] text-text-secondary overflow-x-auto" {...props}>
+        {children}
+      </code>
+    );
+  },
+  pre({ children }: { children?: React.ReactNode }) {
+    return <pre className="bg-surface-sunken rounded-lg overflow-hidden my-3">{children}</pre>;
+  },
+  p({ children }: { children?: React.ReactNode }) {
+    return <p className="text-[15px] leading-relaxed mb-3 last:mb-0">{children}</p>;
+  },
+  strong({ children }: { children?: React.ReactNode }) {
+    return <strong className="font-semibold text-text-primary">{children}</strong>;
+  },
+  ul({ children }: { children?: React.ReactNode }) {
+    return <ul className="list-disc list-inside space-y-1 my-2">{children}</ul>;
+  },
+  ol({ children }: { children?: React.ReactNode }) {
+    return <ol className="list-decimal list-inside space-y-1 my-2">{children}</ol>;
+  },
+  li({ children }: { children?: React.ReactNode }) {
+    return <li className="text-[15px] leading-relaxed">{children}</li>;
+  },
+  h1({ children }: { children?: React.ReactNode }) {
+    return <h1 className="text-lg font-semibold text-text-primary mt-4 mb-2">{children}</h1>;
+  },
+  h2({ children }: { children?: React.ReactNode }) {
+    return <h2 className="text-base font-semibold text-text-primary mt-3 mb-2">{children}</h2>;
+  },
+  h3({ children }: { children?: React.ReactNode }) {
+    return <h3 className="text-sm font-semibold text-text-primary mt-2 mb-1">{children}</h3>;
+  },
+  a({ href, children }: { href?: string; children?: React.ReactNode }) {
+    return <a href={href} className="text-accent hover:underline" target="_blank" rel="noopener noreferrer">{children}</a>;
+  },
+  blockquote({ children }: { children?: React.ReactNode }) {
+    return <blockquote className="border-l-2 border-border pl-3 my-2 text-text-secondary italic">{children}</blockquote>;
+  },
+};
+
+// Slash commands available in the chat
+interface SlashCommand {
+  name: string;
+  description: string;
+  action: "insert" | "execute";
+  value?: string;
+}
+
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: "clear", description: "Clear chat history", action: "execute" },
+  { name: "new", description: "Start a new session", action: "execute" },
+  { name: "screenshot", description: "Take a simulator screenshot", action: "insert", value: "Take a screenshot of the simulator" },
+  { name: "build", description: "Build the project", action: "insert", value: "Build the project" },
+  { name: "run", description: "Run the app", action: "insert", value: "Run the app in the simulator" },
+  { name: "hierarchy", description: "Get view hierarchy", action: "insert", value: "Get the current view hierarchy" },
+  { name: "help", description: "Show available commands", action: "insert", value: "What commands and tools do you have available?" },
+];
+
+// Isolated input component to prevent re-renders of the entire message list
+// This component manages its own input state to avoid re-rendering the parent on every keystroke
+const ChatInput = memo(({
+  onSubmit,
+  onSlashCommand,
+  onOpenContextReview,
+  disabled,
+  inputRef,
+  projectPath
+}: {
+  onSubmit: (text: string) => void;
+  onSlashCommand?: (command: string) => void;
+  onOpenContextReview?: (text: string, fileRefs: { path: string; name: string }[]) => void;
+  disabled: boolean;
+  inputRef: React.RefObject<HTMLTextAreaElement | null>;
+  projectPath: string;
+}) => {
+  const [value, setValue] = useState("");
+  const [hasContent, setHasContent] = useState(false);
+
+  // Autocomplete state
+  const [autocompleteType, setAutocompleteType] = useState<"file" | "command" | null>(null);
+  const [autocompleteItems, setAutocompleteItems] = useState<string[]>([]);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [autocompletePosition, setAutocompletePosition] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Detect @ or / triggers and update autocomplete state
+  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newValue = e.target.value;
+    const cursorPos = e.target.selectionStart || 0;
+    setValue(newValue);
+    setHasContent(newValue.trim().length > 0);
+
+    // Check for / at start of input (slash commands)
+    if (newValue.startsWith("/") && !newValue.includes(" ")) {
+      const query = newValue.slice(1).toLowerCase();
+      setAutocompleteType("command");
+      setAutocompletePosition({ start: 0, end: newValue.length });
+      setSelectedIndex(0);
+
+      // Filter slash commands
+      const filtered = SLASH_COMMANDS
+        .filter(cmd => cmd.name.toLowerCase().includes(query))
+        .map(cmd => cmd.name);
+      setAutocompleteItems(filtered);
+      return;
+    }
+
+    // Check for @ trigger (file references)
+    // Find the last @ before cursor that isn't followed by a space before cursor
+    const textBeforeCursor = newValue.slice(0, cursorPos);
+    const atMatch = textBeforeCursor.match(/@([^\s@]*)$/);
+
+    if (atMatch) {
+      const query = atMatch[1];
+      const atStart = cursorPos - atMatch[0].length;
+      setAutocompleteType("file");
+      setAutocompletePosition({ start: atStart, end: cursorPos });
+      setSelectedIndex(0);
+
+      // Fetch file suggestions
+      invoke<string[]>("list_project_files", {
+        projectPath,
+        query: query || null,
+        limit: 10,
+      }).then(files => {
+        setAutocompleteItems(files);
+      }).catch(err => {
+        console.error("Failed to fetch files:", err);
+        setAutocompleteItems([]);
+      });
+      return;
+    }
+
+    // No autocomplete trigger found
+    setAutocompleteType(null);
+    setAutocompleteItems([]);
+  };
+
+  // Handle keyboard navigation in autocomplete
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Handle autocomplete navigation
+    if (autocompleteType && autocompleteItems.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSelectedIndex(i => Math.min(i + 1, autocompleteItems.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSelectedIndex(i => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === "Tab" || e.key === "Enter") {
+        e.preventDefault();
+        selectAutocompleteItem(autocompleteItems[selectedIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setAutocompleteType(null);
+        setAutocompleteItems([]);
+        return;
+      }
+    }
+
+    // Shift+Enter to open context review modal
+    if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      if (value.trim() && !disabled && onOpenContextReview) {
+        // Extract file references from the message
+        const fileRefs = extractFileReferences(value);
+        onOpenContextReview(value.trim(), fileRefs);
+        setValue("");
+        setHasContent(false);
+        setAutocompleteType(null);
+        setAutocompleteItems([]);
+      }
+      return;
+    }
+
+    // Normal enter to submit directly
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (value.trim() && !disabled) {
+        onSubmit(value.trim());
+        setValue("");
+        setHasContent(false);
+        setAutocompleteType(null);
+        setAutocompleteItems([]);
+      }
+    }
+  };
+
+  // Extract @filepath references from the message text
+  const extractFileReferences = (text: string): { path: string; name: string }[] => {
+    const refs: { path: string; name: string }[] = [];
+    const regex = /@([^\s@]+)/g;
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const path = match[1];
+      const name = path.split("/").pop() || path;
+      refs.push({ path, name });
+    }
+    return refs;
+  };
+
+  // Select an autocomplete item
+  const selectAutocompleteItem = (item: string) => {
+    if (autocompleteType === "command") {
+      const cmd = SLASH_COMMANDS.find(c => c.name === item);
+      if (cmd) {
+        if (cmd.action === "execute") {
+          onSlashCommand?.(cmd.name);
+          setValue("");
+          setHasContent(false);
+        } else if (cmd.action === "insert" && cmd.value) {
+          setValue(cmd.value);
+          setHasContent(true);
+        }
+      }
+    } else if (autocompleteType === "file") {
+      // Replace @query with @filepath
+      const before = value.slice(0, autocompletePosition.start);
+      const after = value.slice(autocompletePosition.end);
+      const newValue = `${before}@${item} ${after}`;
+      setValue(newValue);
+      setHasContent(newValue.trim().length > 0);
+
+      // Move cursor to after the inserted file reference
+      const newCursorPos = autocompletePosition.start + item.length + 2; // +2 for @ and space
+      setTimeout(() => {
+        inputRef.current?.setSelectionRange(newCursorPos, newCursorPos);
+        inputRef.current?.focus();
+      }, 0);
+    }
+
+    setAutocompleteType(null);
+    setAutocompleteItems([]);
+  };
+
+  const handleSubmitClick = () => {
+    if (value.trim() && !disabled) {
+      onSubmit(value.trim());
+      setValue("");
+      setHasContent(false);
+      setAutocompleteType(null);
+      setAutocompleteItems([]);
+    }
+  };
+
+  return (
+    <div className="relative flex items-end gap-2">
+      {/* Autocomplete dropdown */}
+      {autocompleteType && autocompleteItems.length > 0 && (
+        <div
+          ref={dropdownRef}
+          className="absolute bottom-full left-0 right-12 mb-1 bg-surface-raised border border-border rounded-lg shadow-xl overflow-hidden z-50 max-h-64 overflow-y-auto"
+        >
+          <div className="px-2 py-1.5 text-[10px] text-text-tertiary uppercase tracking-wide border-b border-border-subtle">
+            {autocompleteType === "file" ? "Files" : "Commands"}
+          </div>
+          {autocompleteItems.map((item, index) => {
+            const isSelected = index === selectedIndex;
+            const cmd = autocompleteType === "command" ? SLASH_COMMANDS.find(c => c.name === item) : null;
+
+            return (
+              <button
+                key={item}
+                onClick={() => selectAutocompleteItem(item)}
+                className={`w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors ${
+                  isSelected ? "bg-accent/20 text-accent" : "text-text-primary hover:bg-hover"
+                }`}
+              >
+                {autocompleteType === "file" ? (
+                  <>
+                    <svg className="w-4 h-4 text-text-tertiary flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                    </svg>
+                    <span className="truncate font-mono text-xs">{item}</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-accent">/</span>
+                    <span className="font-medium">{item}</span>
+                    {cmd && <span className="text-text-tertiary text-xs ml-auto">{cmd.description}</span>}
+                  </>
+                )}
+              </button>
+            );
+          })}
+          <div className="px-3 py-1.5 text-[10px] text-text-tertiary border-t border-border-subtle">
+            <span className="text-text-secondary">↑↓</span> navigate · <span className="text-text-secondary">Tab</span> select · <span className="text-text-secondary">Esc</span> close
+          </div>
+        </div>
+      )}
+
+      <textarea
+        ref={inputRef}
+        value={value}
+        onChange={handleChange}
+        onKeyDown={handleKeyDown}
+        placeholder="Ask Claude... (@ files, / commands, Shift+Enter to review context)"
+        disabled={disabled}
+        rows={1}
+        className="flex-1 bg-transparent px-4 py-3 text-[15px] text-text-primary placeholder-text-tertiary focus:outline-none resize-none disabled:opacity-50"
+        style={{ minHeight: "48px", maxHeight: "200px" }}
+      />
+      <button
+        type="button"
+        onClick={handleSubmitClick}
+        disabled={!hasContent || disabled}
+        className="p-2 mr-2 mb-2 rounded-lg bg-surface-overlay hover:bg-hover text-text-secondary disabled:opacity-30 disabled:hover:bg-surface-overlay transition-colors"
+      >
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7m0 0l7 7m-7-7v18" />
+        </svg>
+      </button>
+    </div>
+  );
+});
 
 // Animated counter hook for smooth number transitions
 const useAnimatedCounter = (value: number, duration = 300) => {
@@ -130,21 +474,25 @@ const DiffDisplay = ({ oldString, newString }: { oldString: string; newString: s
   const newLines = newString.split("\n");
 
   return (
-    <div className="mt-2 bg-surface-sunken rounded-lg overflow-hidden font-mono text-xs">
+    <div className="mt-2 rounded-lg overflow-hidden font-mono text-xs border border-border">
       {/* Removed lines */}
-      {oldLines.map((line, i) => (
-        <div key={`old-${i}`} className="flex">
-          <span className="w-6 text-center bg-error/20 text-error select-none">-</span>
-          <pre className="flex-1 px-2 bg-error/10 text-error/80 overflow-x-auto whitespace-pre">{line || " "}</pre>
-        </div>
-      ))}
+      <div className="bg-error/5 border-b border-border">
+        {oldLines.map((line, i) => (
+          <div key={`old-${i}`} className="flex items-start">
+            <span className="w-6 shrink-0 text-center text-error py-0.5 select-none">-</span>
+            <code className="flex-1 px-2 py-0.5 text-error overflow-x-auto">{line || " "}</code>
+          </div>
+        ))}
+      </div>
       {/* Added lines */}
-      {newLines.map((line, i) => (
-        <div key={`new-${i}`} className="flex">
-          <span className="w-6 text-center bg-success/20 text-success select-none">+</span>
-          <pre className="flex-1 px-2 bg-success/10 text-success/80 overflow-x-auto whitespace-pre">{line || " "}</pre>
-        </div>
-      ))}
+      <div className="bg-success/5">
+        {newLines.map((line, i) => (
+          <div key={`new-${i}`} className="flex items-start">
+            <span className="w-6 shrink-0 text-center text-success py-0.5 select-none">+</span>
+            <code className="flex-1 px-2 py-0.5 text-success overflow-x-auto">{line || " "}</code>
+          </div>
+        ))}
+      </div>
     </div>
   );
 };
@@ -380,6 +728,14 @@ const formatToolDisplay = (toolName: string, toolInput: string | undefined): {
         return { summary: "Fetching URL", detail: url };
       }
     }
+    case "WebSearch": {
+      const query = String(parsed.query || "");
+      const truncatedQuery = query.length > 50 ? query.slice(0, 50) + "..." : query;
+      return {
+        summary: `Searching: "${truncatedQuery}"`,
+        detail: query,
+      };
+    }
     default:
       // Try to make any remaining tool names more readable
       return { summary: normalizedName.replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2") };
@@ -400,7 +756,7 @@ export const AgentPane = ({
   onPendingSessionActionHandled,
 }: AgentPaneProps) => {
   const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState("");
+  // Note: input state moved to ChatInput component to prevent re-renders
   const [status, setStatus] = useState<SessionStatus>("disconnected");
   const [error, setError] = useState<string | null>(null);
   const [workingTime, setWorkingTime] = useState(0);
@@ -409,12 +765,19 @@ export const AgentPane = ({
     type: "thinking" | "tool";
     toolName?: string;
     toolInput?: string;
+    progressStep?: number;
+    progressTotal?: number;
+    progressMessage?: string;
   } | null>(null);
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [skipPermissions, setSkipPermissions] = useState(false);
   const [availableSkills, setAvailableSkills] = useState<string[]>([]);
   const [_claudeModel, setClaudeModel] = useState<string | null>(null);
   const [showSkillsModal, setShowSkillsModal] = useState(false);
+  // Context review modal state
+  const [showContextModal, setShowContextModal] = useState(false);
+  const [pendingMessage, setPendingMessage] = useState("");
+  const [pendingFileRefs, setPendingFileRefs] = useState<{ path: string; name: string }[]>([]);
   // Model selection and resume state
   const [selectedModel, setSelectedModel] = useState<string>("sonnet");
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
@@ -433,6 +796,8 @@ export const AgentPane = ({
   const [currentTurnTools, setCurrentTurnTools] = useState<Array<{
     name: string;
     input?: string;
+    result?: string;
+    toolId?: string;
   }>>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -441,7 +806,11 @@ export const AgentPane = ({
   const responseStartTimeRef = useRef<number>(0);
   const skipPermissionsRef = useRef(skipPermissions);
   // Use ref for turn tools to avoid React batching issues with rapid events
-  const currentTurnToolsRef = useRef<Array<{ name: string; input?: string }>>([]);
+  const currentTurnToolsRef = useRef<Array<{ name: string; input?: string; result?: string; toolId?: string }>>([]);
+  // Track token usage with ref for reliable access in event handlers (avoids stale closures)
+  const tokenUsageRef = useRef({ input: 0, output: 0, cacheRead: 0, cacheCreation: 0 });
+  // Track if initial mount setup has completed - prevents race conditions with skipPermissions effect
+  const initialMountCompleteRef = useRef(false);
 
   // Animated token counter
   const animatedOutputTokens = useAnimatedCounter(tokenUsage.output);
@@ -498,11 +867,20 @@ export const AgentPane = ({
   useEffect(() => {
     skipPermissionsRef.current = skipPermissions;
 
-    // If skipPermissions enabled AND no messages yet, restart Claude with the native flag
+    // Only update backend setting, don't restart during initial mount
+    // The session is started with the correct flag in the main setup effect
+    if (!initialMountCompleteRef.current) {
+      // During initial mount, just update the backend setting
+      invoke("set_skip_permissions", { enabled: skipPermissions }).catch(console.error);
+      return;
+    }
+
+    // If skipPermissions changed after mount AND no messages yet, restart with the flag
     // This is faster than using our permission server for auto-approve
     if (skipPermissions && messages.length === 0 && status === "connected") {
       const restartWithFlag = async () => {
         try {
+          console.log("Restarting Claude with skipPermissions flag...");
           await invoke("stop_claude_session");
           await invoke("start_claude_session", {
             workingDir: PROJECT_DIR,
@@ -558,13 +936,21 @@ export const AgentPane = ({
 
           // Set loaded messages (or show system message if none)
           if (sessionMessages.length > 0) {
-            const loadedMessages: Message[] = sessionMessages.map((msg) => ({
-              id: msg.id,
-              type: msg.messageType as "user" | "assistant",
-              content: msg.content,
-              timestamp: new Date(),
-              toolsUsed: msg.toolsUsed,
-            }));
+            // Deduplicate by ID
+            const seen = new Set<string>();
+            const loadedMessages: Message[] = [];
+            for (const msg of sessionMessages) {
+              if (!seen.has(msg.id)) {
+                seen.add(msg.id);
+                loadedMessages.push({
+                  id: msg.id,
+                  type: msg.messageType as "user" | "assistant",
+                  content: msg.content,
+                  timestamp: new Date(),
+                  toolsUsed: msg.toolsUsed,
+                });
+              }
+            }
             setMessages(loadedMessages);
           } else {
             setMessages([{
@@ -655,15 +1041,23 @@ export const AgentPane = ({
       // Listen for user messages sent from outside (e.g., simulator recording)
       unlistenUserMessage = await listen<{ content: string }>("user-message", (event) => {
         console.log("User message received:", event.payload.content.slice(0, 100));
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString(),
-            type: "user",
-            content: event.payload.content,
-            timestamp: new Date(),
-          },
-        ]);
+        setMessages((prev) => {
+          // Prevent duplicate user messages
+          const lastMsg = prev[prev.length - 1];
+          if (lastMsg && lastMsg.type === "user" && lastMsg.content === event.payload.content) {
+            console.log("Skipping duplicate user message from event");
+            return prev;
+          }
+          return [
+            ...prev,
+            {
+              id: Date.now().toString(),
+              type: "user",
+              content: event.payload.content,
+              timestamp: new Date(),
+            },
+          ];
+        });
       });
 
       unlisten = await listen<ClaudeEvent>("claude-event", (event) => {
@@ -689,6 +1083,7 @@ export const AgentPane = ({
           setToolCalls([]);
           setCurrentActivity({ type: "thinking" });
           setTokenUsage({ input: 0, output: 0, cacheRead: 0, cacheCreation: 0 });
+          tokenUsageRef.current = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }; // Reset ref too
           // Clear turn tracking for new turn
           setCurrentTurnContent("");
           setCurrentTurnTools([]);
@@ -740,24 +1135,29 @@ export const AgentPane = ({
         // Handle token usage updates - use Math.max to keep cumulative count (tokens only go up)
         if (eventType === "usage") {
           const { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens } = event.payload;
-          setTokenUsage((prev) => ({
-            input: Math.max(prev.input, inputTokens || 0),
-            output: Math.max(prev.output, outputTokens || 0),
-            cacheRead: Math.max(prev.cacheRead, cacheReadTokens || 0),
-            cacheCreation: Math.max(prev.cacheCreation, cacheCreationTokens || 0),
-          }));
+          // Update both state and ref (ref for reliable access in event handlers)
+          const newUsage = {
+            input: Math.max(tokenUsageRef.current.input, inputTokens || 0),
+            output: Math.max(tokenUsageRef.current.output, outputTokens || 0),
+            cacheRead: Math.max(tokenUsageRef.current.cacheRead, cacheReadTokens || 0),
+            cacheCreation: Math.max(tokenUsageRef.current.cacheCreation, cacheCreationTokens || 0),
+          };
+          tokenUsageRef.current = newUsage;
+          setTokenUsage(newUsage);
           return;
         }
 
         // Also check for token usage in other event types (assistant, result)
         const { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens } = event.payload;
         if (inputTokens || outputTokens) {
-          setTokenUsage((prev) => ({
-            input: Math.max(prev.input, inputTokens || 0),
-            output: Math.max(prev.output, outputTokens || 0),
-            cacheRead: Math.max(prev.cacheRead, cacheReadTokens || 0),
-            cacheCreation: Math.max(prev.cacheCreation, cacheCreationTokens || 0),
-          }));
+          const newUsage = {
+            input: Math.max(tokenUsageRef.current.input, inputTokens || 0),
+            output: Math.max(tokenUsageRef.current.output, outputTokens || 0),
+            cacheRead: Math.max(tokenUsageRef.current.cacheRead, cacheReadTokens || 0),
+            cacheCreation: Math.max(tokenUsageRef.current.cacheCreation, cacheCreationTokens || 0),
+          };
+          tokenUsageRef.current = newUsage;
+          setTokenUsage(newUsage);
         }
 
         if (eventType === "result") {
@@ -771,6 +1171,19 @@ export const AgentPane = ({
               : undefined;
 
             console.log("Result event - tools used:", toolsUsed?.length || 0, toolsUsed);
+
+            // Capture token usage - use values from the result event if available, otherwise from accumulated ref
+            const finalOutputTokens = event.payload.outputTokens || tokenUsageRef.current.output;
+            const finalInputTokens = event.payload.inputTokens || tokenUsageRef.current.input;
+            const finalCacheReadTokens = event.payload.cacheReadTokens || tokenUsageRef.current.cacheRead;
+            const finalCacheCreationTokens = event.payload.cacheCreationTokens || tokenUsageRef.current.cacheCreation;
+
+            // Check if agent hit max turns limit
+            const { resultSubtype, numTurns } = event.payload;
+            const hitMaxTurns = resultSubtype === "error_max_turns";
+            if (hitMaxTurns) {
+              console.log("Agent hit max turns limit:", numTurns);
+            }
 
             setMessages((prev) => {
               // Prevent duplicate messages - check if last message has same content
@@ -788,6 +1201,12 @@ export const AgentPane = ({
                   timestamp: new Date(),
                   duration,
                   toolsUsed,
+                  outputTokens: finalOutputTokens,
+                  inputTokens: finalInputTokens,
+                  cacheReadTokens: finalCacheReadTokens,
+                  cacheCreationTokens: finalCacheCreationTokens,
+                  hitMaxTurns,
+                  numTurns,
                 },
               ];
             });
@@ -821,8 +1240,8 @@ export const AgentPane = ({
 
         // Handle tool_use events (SDK sends these separately)
         if (eventType === "tool_use") {
-          const { toolInput } = event.payload;
-          console.log("🔧 TOOL_USE event:", toolName, "ref count:", currentTurnToolsRef.current.length);
+          const { toolInput, toolId } = event.payload;
+          console.log("🔧 TOOL_USE event:", toolName, "id:", toolId, "ref count:", currentTurnToolsRef.current.length);
           if (toolName) {
             setCurrentActivity({
               type: "tool",
@@ -835,7 +1254,7 @@ export const AgentPane = ({
             });
             // Add to turn tools history - use BOTH ref and state
             // Ref is for reliable capture on result, state is for UI display
-            const toolEntry = { name: toolName, input: toolInput || undefined };
+            const toolEntry = { name: toolName, input: toolInput || undefined, toolId: toolId || undefined };
             currentTurnToolsRef.current = [...currentTurnToolsRef.current, toolEntry];
             console.log("🔧 Added to ref, new count:", currentTurnToolsRef.current.length);
             setCurrentTurnTools((prev) => [...prev, toolEntry]);
@@ -845,8 +1264,44 @@ export const AgentPane = ({
 
         // Handle tool_result events (SDK sends these after tool execution)
         if (eventType === "tool_result") {
-          // Tool result received - the next event will be assistant or another tool
-          console.log("Tool result received for tool:", event.payload.toolId);
+          const { toolId, result } = event.payload as { toolId?: string; result?: string };
+          console.log("📋 Tool result received for:", toolId, "result length:", result?.length || 0);
+
+          // Attach result to the matching tool in our ref
+          if (toolId && result) {
+            const toolIndex = currentTurnToolsRef.current.findIndex(t => t.toolId === toolId);
+            if (toolIndex !== -1) {
+              currentTurnToolsRef.current[toolIndex] = {
+                ...currentTurnToolsRef.current[toolIndex],
+                result,
+              };
+              // Also update state for UI
+              setCurrentTurnTools([...currentTurnToolsRef.current]);
+              console.log("📋 Attached result to tool at index:", toolIndex);
+            }
+          }
+          return;
+        }
+
+        // Handle tool_progress events (shows step progress for multi-step tools like app_context)
+        if (eventType === "tool_progress") {
+          const { progressStep, progressTotal, progressMessage } = event.payload as {
+            progressStep?: number;
+            progressTotal?: number;
+            progressMessage?: string;
+          };
+          console.log("📊 Tool progress:", progressStep, "/", progressTotal, progressMessage);
+
+          // Update current activity with progress info
+          setCurrentActivity(prev => {
+            if (!prev || prev.type !== "tool") return prev;
+            return {
+              ...prev,
+              progressStep,
+              progressTotal,
+              progressMessage,
+            };
+          });
           return;
         }
 
@@ -904,14 +1359,21 @@ export const AgentPane = ({
             });
 
             if (sessionMessages.length > 0) {
-              // Convert session messages to our Message format
-              const loadedMessages: Message[] = sessionMessages.map((msg) => ({
-                id: msg.id,
-                type: msg.messageType as "user" | "assistant",
-                content: msg.content,
-                timestamp: new Date(),
-                toolsUsed: msg.toolsUsed,
-              }));
+              // Convert session messages to our Message format, deduplicating by ID
+              const seen = new Set<string>();
+              const loadedMessages: Message[] = [];
+              for (const msg of sessionMessages) {
+                if (!seen.has(msg.id)) {
+                  seen.add(msg.id);
+                  loadedMessages.push({
+                    id: msg.id,
+                    type: msg.messageType as "user" | "assistant",
+                    content: msg.content,
+                    timestamp: new Date(),
+                    toolsUsed: msg.toolsUsed,
+                  });
+                }
+              }
               setMessages(loadedMessages);
               console.log(`Loaded ${loadedMessages.length} messages from session`);
             }
@@ -931,6 +1393,9 @@ export const AgentPane = ({
         });
 
         setStatus("connected");
+        // Mark initial mount as complete - skipPermissions effect will now behave normally
+        initialMountCompleteRef.current = true;
+        console.log("Initial mount complete, session connected");
 
         // Restore cached session info (survives HMR)
         try {
@@ -986,26 +1451,42 @@ export const AgentPane = ({
     setPermissionRequest(null);
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || status === "working") return;
+  // Called by ChatInput component when user submits
+  const handleInputSubmit = async (userMessage: string) => {
+    if (!userMessage || status === "working") return;
 
-    const userMessage = input.trim();
-    setInput("");
+    console.log("📤 handleInputSubmit called with:", userMessage.slice(0, 50));
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: Date.now().toString(),
-        type: "user",
-        content: userMessage,
-        timestamp: new Date(),
-      },
-    ]);
+    setMessages((prev) => {
+      // Prevent duplicate user messages (can happen with React StrictMode or rapid submits)
+      const lastMsg = prev[prev.length - 1];
+      if (lastMsg && lastMsg.type === "user" && lastMsg.content === userMessage) {
+        console.log("Skipping duplicate user message");
+        return prev;
+      }
+      return [
+        ...prev,
+        {
+          id: Date.now().toString(),
+          type: "user",
+          content: userMessage,
+          timestamp: new Date(),
+        },
+      ];
+    });
+
+    // Set working status IMMEDIATELY so user sees feedback
+    // The message_sent event will also set it, but this ensures immediate feedback
+    setStatus("working");
+    setToolCalls([]);
+    setCurrentActivity({ type: "thinking" });
 
     try {
+      console.log("📤 Calling send_claude_message...");
       await invoke("send_claude_message", { message: userMessage });
+      console.log("📤 send_claude_message returned successfully");
     } catch (err) {
+      console.error("📤 send_claude_message FAILED:", err);
       setStatus("error");
       setError(String(err));
       setMessages((prev) => [
@@ -1020,43 +1501,26 @@ export const AgentPane = ({
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit(e);
-    }
-  };
-
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
   };
 
-  // Change model and restart session
+  // Change model and restart session while preserving conversation
   const handleModelChange = async (modelId: string) => {
     setSelectedModel(modelId);
     setShowModelMenu(false);
 
-    // Restart session with new model
+    // Restart session with new model, keeping the same session to preserve conversation
     setStatus("connecting");
-    setMessages([]); // Clear messages for new session
     try {
-      // Save current session first
-      if (currentSessionId) {
-        await invoke("save_session_to_history", { lastMessage: messages[messages.length - 1]?.content || null });
-      }
-
       const sessionId = await invoke<string>("start_claude_session", {
         workingDir: PROJECT_DIR,
         skipPermissions: skipPermissions,
         model: modelId,
-        resumeSessionId: null,
+        resumeSessionId: currentSessionId, // Resume same session with new model
       });
       setCurrentSessionId(sessionId);
       setStatus("connected");
-
-      // Refresh saved sessions
-      const sessions = await invoke<SavedSession[]>("get_recent_sessions");
-      setSavedSessions(sessions);
     } catch (err) {
       setStatus("error");
       setError(String(err));
@@ -1087,13 +1551,21 @@ export const AgentPane = ({
 
       // Set loaded messages (or show system message if none)
       if (sessionMessages.length > 0) {
-        const loadedMessages: Message[] = sessionMessages.map((msg) => ({
-          id: msg.id,
-          type: msg.messageType as "user" | "assistant",
-          content: msg.content,
-          timestamp: new Date(),
-          toolsUsed: msg.toolsUsed,
-        }));
+        // Deduplicate by ID
+        const seen = new Set<string>();
+        const loadedMessages: Message[] = [];
+        for (const msg of sessionMessages) {
+          if (!seen.has(msg.id)) {
+            seen.add(msg.id);
+            loadedMessages.push({
+              id: msg.id,
+              type: msg.messageType as "user" | "assistant",
+              content: msg.content,
+              timestamp: new Date(),
+              toolsUsed: msg.toolsUsed,
+            });
+          }
+        }
         setMessages(loadedMessages);
         console.log(`Loaded ${loadedMessages.length} messages from resumed session`);
       } else {
@@ -1156,7 +1628,7 @@ export const AgentPane = ({
     <div className="flex flex-col h-full bg-surface-base">
       {/* Messages area */}
       <div className="flex-1 overflow-auto">
-        <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
+        <div className="w-full px-6 py-4 space-y-4">
           {messages.length === 0 && status === "connected" && (
             <div className="text-center py-12">
               <p className="text-text-secondary text-sm">
@@ -1179,74 +1651,47 @@ export const AgentPane = ({
 
               {msg.type === "assistant" && (
                 <div className="space-y-2">
+                  {/* Max turns warning banner */}
+                  {msg.hitMaxTurns && (
+                    <div className="flex items-center gap-2 px-3 py-2 bg-warning/10 border border-warning/30 rounded-lg text-warning text-sm">
+                      <span className="text-lg">⚠</span>
+                      <div>
+                        <span className="font-medium">Agent stopped early</span>
+                        <span className="text-warning/70 ml-1">
+                          ({msg.numTurns} turns) — Task may be incomplete. Send another message to continue.
+                        </span>
+                      </div>
+                    </div>
+                  )}
                   <div className="prose prose-invert prose-sm max-w-none text-text-primary">
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm]}
-                      components={{
-                        // Code blocks
-                        code({ className, children, ...props }) {
-                          const isInline = !className;
-                          if (isInline) {
-                            return (
-                              <code className="px-1.5 py-0.5 bg-surface-overlay rounded text-accent-muted font-mono text-[13px]" {...props}>
-                                {children}
-                              </code>
-                            );
-                          }
-                          return (
-                            <code className="block bg-surface-sunken rounded-lg p-3 font-mono text-[13px] text-text-secondary overflow-x-auto" {...props}>
-                              {children}
-                            </code>
-                          );
-                        },
-                        // Pre wrapper for code blocks
-                        pre({ children }) {
-                          return <pre className="bg-surface-sunken rounded-lg overflow-hidden my-3">{children}</pre>;
-                        },
-                        // Paragraphs
-                        p({ children }) {
-                          return <p className="text-[15px] leading-relaxed mb-3 last:mb-0">{children}</p>;
-                        },
-                        // Bold
-                        strong({ children }) {
-                          return <strong className="font-semibold text-text-primary">{children}</strong>;
-                        },
-                        // Lists
-                        ul({ children }) {
-                          return <ul className="list-disc list-inside space-y-1 my-2">{children}</ul>;
-                        },
-                        ol({ children }) {
-                          return <ol className="list-decimal list-inside space-y-1 my-2">{children}</ol>;
-                        },
-                        li({ children }) {
-                          return <li className="text-[15px] leading-relaxed">{children}</li>;
-                        },
-                        // Headings
-                        h1({ children }) {
-                          return <h1 className="text-lg font-semibold text-text-primary mt-4 mb-2">{children}</h1>;
-                        },
-                        h2({ children }) {
-                          return <h2 className="text-base font-semibold text-text-primary mt-3 mb-2">{children}</h2>;
-                        },
-                        h3({ children }) {
-                          return <h3 className="text-sm font-semibold text-text-primary mt-2 mb-1">{children}</h3>;
-                        },
-                        // Links
-                        a({ href, children }) {
-                          return <a href={href} className="text-accent hover:underline" target="_blank" rel="noopener noreferrer">{children}</a>;
-                        },
-                        // Blockquotes
-                        blockquote({ children }) {
-                          return <blockquote className="border-l-2 border-border pl-3 my-2 text-text-secondary italic">{children}</blockquote>;
-                        },
-                      }}
+                      components={MARKDOWN_COMPONENTS}
                     >
                       {msg.content}
                     </ReactMarkdown>
                   </div>
-                  {msg.duration && (
+                  {(msg.duration || msg.outputTokens) && (
                     <div className="flex items-center gap-2 text-text-tertiary text-xs">
-                      <span>{msg.duration.toFixed(1)}s</span>
+                      {msg.duration && <span>{msg.duration.toFixed(1)}s</span>}
+                      {msg.outputTokens && msg.outputTokens > 0 && (
+                        <>
+                          {msg.duration && <span>·</span>}
+                          <span className="tabular-nums">↓ {formatTokenCount(msg.outputTokens)}</span>
+                        </>
+                      )}
+                      {msg.inputTokens && msg.inputTokens > 0 && (
+                        <>
+                          <span>·</span>
+                          <span className="tabular-nums">↑ {formatTokenCount(msg.inputTokens)}</span>
+                        </>
+                      )}
+                      {msg.cacheReadTokens && msg.cacheReadTokens > 0 && (
+                        <>
+                          <span>·</span>
+                          <span className="tabular-nums text-success">⚡ {formatTokenCount(msg.cacheReadTokens)}</span>
+                        </>
+                      )}
                       <button
                         onClick={() => copyToClipboard(msg.content)}
                         className="hover:text-text-secondary transition-colors"
@@ -1258,9 +1703,9 @@ export const AgentPane = ({
                       </button>
                     </div>
                   )}
-                  {/* Tool use summary - collapsible */}
+                  {/* Tool use summary - expanded by default for visibility */}
                   {msg.toolsUsed && msg.toolsUsed.length > 0 && (
-                    <details className="mt-2 group">
+                    <details className="mt-2 group" open={msg.toolsUsed.length <= 10}>
                       <summary className="text-xs text-text-tertiary cursor-pointer hover:text-text-secondary select-none flex items-center gap-1.5">
                         <svg className="w-3 h-3 transition-transform group-open:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
@@ -1270,6 +1715,12 @@ export const AgentPane = ({
                       <div className="mt-2 pl-4 space-y-1.5 font-mono text-xs border-l border-border-subtle">
                         {msg.toolsUsed.map((tool, i) => {
                           const { summary, detail, diff } = formatToolDisplay(tool.name, tool.input);
+                          const normalizedName = tool.name.startsWith("mcp__")
+                            ? tool.name.split("__").pop() || tool.name
+                            : tool.name;
+                          const hasResult = tool.result && tool.result.length > 0;
+                          const isSearchTool = normalizedName === "WebSearch" || normalizedName === "WebFetch";
+
                           return (
                             <div key={i} className="space-y-1">
                               <div className="flex items-start gap-2">
@@ -1284,6 +1735,20 @@ export const AgentPane = ({
                                 </div>
                               </div>
                               {diff && <DiffDisplay oldString={diff.oldString} newString={diff.newString} />}
+                              {/* Show result for search tools and other tools with results */}
+                              {hasResult && isSearchTool && (
+                                <details className="ml-4 mt-1 group/result">
+                                  <summary className="text-[10px] text-text-tertiary cursor-pointer hover:text-text-secondary select-none flex items-center gap-1">
+                                    <svg className="w-2.5 h-2.5 transition-transform group-open/result:rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                    </svg>
+                                    <span>View result ({tool.result!.length > 1000 ? `${(tool.result!.length / 1000).toFixed(1)}KB` : `${tool.result!.length} chars`})</span>
+                                  </summary>
+                                  <pre className="mt-1 p-2 bg-surface-sunken rounded text-[10px] text-text-tertiary overflow-auto max-h-40 whitespace-pre-wrap">
+                                    {tool.result!.slice(0, 2000)}{tool.result!.length > 2000 ? "\n... (truncated)" : ""}
+                                  </pre>
+                                </details>
+                              )}
                             </div>
                           );
                         })}
@@ -1316,6 +1781,11 @@ export const AgentPane = ({
                 <span className="text-accent animate-pulse">▸</span>
                 <span className="text-text-secondary">
                   Working... {workingTime.toFixed(0)}s
+                  {toolCalls.length > 0 && (
+                    <span className="ml-2 tabular-nums text-text-tertiary">
+                      · {toolCalls.length} turns
+                    </span>
+                  )}
                   {animatedOutputTokens > 0 && (
                     <span className="ml-2 text-text-tertiary tabular-nums">
                       · ↓ {formatTokenCount(animatedOutputTokens)} tokens
@@ -1339,6 +1809,24 @@ export const AgentPane = ({
                           <div className="mt-1.5 pl-4">
                             <span className="text-xs text-text-tertiary font-mono truncate block" title={detail}>
                               {detail}
+                            </span>
+                          </div>
+                        )}
+                        {/* Show progress for multi-step tools like app_context */}
+                        {currentActivity.progressMessage && (
+                          <div className="mt-2 pl-4 flex items-center gap-2">
+                            <div className="flex-1 h-1 bg-surface-overlay rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-accent transition-all duration-300"
+                                style={{
+                                  width: currentActivity.progressTotal
+                                    ? `${(currentActivity.progressStep || 0) / currentActivity.progressTotal * 100}%`
+                                    : '0%'
+                                }}
+                              />
+                            </div>
+                            <span className="text-xs text-text-tertiary whitespace-nowrap">
+                              {currentActivity.progressStep}/{currentActivity.progressTotal} {currentActivity.progressMessage}
                             </span>
                           </div>
                         )}
@@ -1375,12 +1863,30 @@ export const AgentPane = ({
               )}
 
               {/* Thinking indicator */}
-              {currentActivity?.type === "thinking" && (
+              {currentActivity?.type === "thinking" && !currentTurnContent && (
                 <div className="flex items-center gap-2 text-text-tertiary">
                   <span className="animate-pulse">∴</span>
                   <span>Thinking...</span>
                 </div>
               )}
+
+              {/* Show most recent thought (last sentence/chunk, not entire history) */}
+              {currentTurnContent && (() => {
+                // Get just the last meaningful chunk - find last sentence or take last 150 chars
+                const trimmed = currentTurnContent.trim();
+                const sentences = trimmed.split(/(?<=[.!?])\s+/);
+                const lastSentence = sentences[sentences.length - 1] || "";
+                const display = lastSentence.length > 150
+                  ? "..." + lastSentence.slice(-150)
+                  : lastSentence;
+
+                return (
+                  <div className="flex items-start gap-2 text-text-tertiary text-sm italic">
+                    <span className="text-text-tertiary/50">💭</span>
+                    <span className="line-clamp-2">{display}</span>
+                  </div>
+                );
+              })()}
 
               {/* Tool call history */}
               {toolCalls.length > 0 && (
@@ -1489,21 +1995,27 @@ export const AgentPane = ({
 
       {/* Input area */}
       <div className="border-t border-border-subtle bg-surface-base">
-        <div className="max-w-3xl mx-auto p-4">
-          <form onSubmit={handleSubmit}>
-            <div className="bg-surface-raised border border-border rounded-xl">
-              <textarea
-                ref={inputRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Ask Claude to make changes..."
-                disabled={status === "working" || status === "connecting"}
-                rows={1}
-                className="w-full bg-transparent px-4 py-3 text-[15px] text-text-primary placeholder-text-tertiary focus:outline-none resize-none disabled:opacity-50"
-                style={{ minHeight: "48px", maxHeight: "200px" }}
-              />
-              <div className="flex items-center justify-between px-3 py-2 border-t border-border-subtle">
+        <div className="w-full px-6 py-3">
+          <div className="bg-surface-raised border border-border rounded-xl">
+            <ChatInput
+              onSubmit={handleInputSubmit}
+              onSlashCommand={(cmd) => {
+                if (cmd === "clear") {
+                  setMessages([]);
+                } else if (cmd === "new") {
+                  handleNewSession();
+                }
+              }}
+              onOpenContextReview={(message, fileRefs) => {
+                setPendingMessage(message);
+                setPendingFileRefs(fileRefs);
+                setShowContextModal(true);
+              }}
+              disabled={status === "working" || status === "connecting"}
+              inputRef={inputRef}
+              projectPath={PROJECT_DIR}
+            />
+            <div className="flex items-center justify-between px-3 py-2 border-t border-border-subtle">
                 <div className="flex items-center gap-2">
                   {/* Model selector dropdown */}
                   <div className="relative">
@@ -1635,41 +2147,63 @@ export const AgentPane = ({
                     <span>{skipPermissions ? "⚡" : "🔒"}</span>
                     <span>{skipPermissions ? "Skip Perms" : "Safe Mode"}</span>
                   </button>
-                </div>
-                <div className="flex items-center gap-1">
-                  {status === "working" && (
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        try {
-                          await invoke("cancel_claude_request", {
-                            workingDir: PROJECT_DIR,
-                            skipPermissions: false,
-                          });
-                          // Keep currentActivity and toolCalls so user sees what was happening
-                          setStatus("interrupted");
-                        } catch (err) {
-                          console.error("Failed to cancel:", err);
-                        }
-                      }}
-                      className="px-3 py-1.5 text-xs text-text-tertiary hover:text-error transition-colors"
-                    >
-                      Cancel
-                    </button>
-                  )}
+                  {/* Context button - opens modal to add screenshot */}
                   <button
-                    type="submit"
-                    disabled={!input.trim() || status === "working" || status === "connecting"}
-                    className="p-2 rounded-lg bg-surface-overlay hover:bg-hover text-text-secondary disabled:opacity-30 disabled:hover:bg-surface-overlay transition-colors"
+                    type="button"
+                    onClick={() => {
+                      setPendingMessage("");
+                      setPendingFileRefs([]);
+                      setShowContextModal(true);
+                    }}
+                    disabled={status === "working" || status === "connecting"}
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-colors bg-accent/20 text-accent hover:bg-accent/30 disabled:opacity-50"
+                    title="Add screenshot context"
                   >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                     </svg>
+                    <span>Context</span>
                   </button>
                 </div>
-              </div>
+                {/* Context remaining indicator */}
+                {tokenUsage.input > 0 && (
+                  <div className="flex items-center gap-1.5 text-xs text-text-tertiary">
+                    <span>Context left:</span>
+                    <span className={`font-mono ${
+                      Math.max(0, 100 - Math.round(tokenUsage.input / 2000)) <= 20
+                        ? "text-error"
+                        : Math.max(0, 100 - Math.round(tokenUsage.input / 2000)) <= 40
+                          ? "text-warning"
+                          : "text-text-secondary"
+                    }`}>
+                      {Math.max(0, 100 - Math.round(tokenUsage.input / 2000))}%
+                    </span>
+                  </div>
+                )}
+                {status === "working" && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // Set status immediately for instant feedback
+                      // Don't wait for the backend - user wants it stopped NOW
+                      setStatus("interrupted");
+                      setCurrentActivity(null);
+
+                      // Fire and forget - don't await
+                      invoke("cancel_claude_request", {
+                        workingDir: PROJECT_DIR,
+                        skipPermissions: false,
+                      }).catch((err) => {
+                        console.error("Failed to cancel:", err);
+                      });
+                    }}
+                    className="px-3 py-1.5 text-xs text-text-tertiary hover:text-error transition-colors"
+                  >
+                    Cancel
+                  </button>
+                )}
             </div>
-          </form>
+          </div>
         </div>
       </div>
 
@@ -1753,6 +2287,42 @@ export const AgentPane = ({
         isOpen={showSkillsModal}
         onClose={() => setShowSkillsModal(false)}
         activeSkills={availableSkills}
+        projectPath={PROJECT_DIR}
+      />
+
+      {/* Chat Context Review Modal */}
+      <ChatContextModal
+        isOpen={showContextModal}
+        onClose={() => {
+          setShowContextModal(false);
+          setPendingMessage("");
+          setPendingFileRefs([]);
+        }}
+        onSend={(message, context) => {
+          // Build enhanced message with context info
+          let enhancedMessage = message;
+
+          const screenshotIncluded = context.some(c => c.type === "screenshot" && c.enabled);
+          const fileRefs = context.filter(c => c.type === "file" && c.enabled);
+
+          if (screenshotIncluded || fileRefs.length > 0) {
+            const contextParts: string[] = [];
+            if (screenshotIncluded) {
+              contextParts.push("a screenshot of the current simulator state");
+            }
+            if (fileRefs.length > 0) {
+              contextParts.push(`the following files: ${fileRefs.map(f => f.label).join(", ")}`);
+            }
+            enhancedMessage = `${message}\n\n[Context: I've included ${contextParts.join(" and ")}. Please use the available tools to access this context.]`;
+          }
+
+          handleInputSubmit(enhancedMessage);
+          setShowContextModal(false);
+          setPendingMessage("");
+          setPendingFileRefs([]);
+        }}
+        initialMessage={pendingMessage}
+        fileReferences={pendingFileRefs}
         projectPath={PROJECT_DIR}
       />
     </div>

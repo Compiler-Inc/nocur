@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { convertFileSrc } from "@tauri-apps/api/core";
 
 type SimulatorState = "disconnected" | "running" | "observing" | "captured";
 
@@ -8,6 +9,7 @@ interface ClaudeEvent {
   eventType: string;
   content: string;
   toolName: string | null;
+  toolInput: string | null;  // Contains filepath for agent_screenshot
 }
 
 interface FrameData {
@@ -88,6 +90,8 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
   const [isClaudeWatching, setIsClaudeWatching] = useState(false);
   const [claudeToolName, setClaudeToolName] = useState<string | null>(null);
   const [errorCount, setErrorCount] = useState(0);
+  // Flag to prevent auto-restart after manual stop/discard
+  const [manualStopFlag, setManualStopFlag] = useState(false);
   const frameCountRef = useRef(0);
   const lastFpsUpdateRef = useRef(Date.now());
   const lastCaptureRef = useRef<string | null>(null);
@@ -144,6 +148,7 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
       setCapturedLogs([]);
       setCapturedCrashes([]);
       setErrorCount(0);
+      setManualStopFlag(false); // Clear flag when manually starting
       lastCaptureRef.current = null;
     } catch (e) {
       console.error("Failed to start observation:", e);
@@ -203,6 +208,7 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
     setIsLiveMode(false);
     setState("captured");
     setFps(0);
+    setManualStopFlag(true); // Prevent auto-restart after manual stop
   }, [screenshotUrl]);
 
   // Send captured data to Claude
@@ -234,24 +240,15 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
     setState("running");
   }, []);
 
-  // Focus the Simulator app
-  const focusSimulator = useCallback(async () => {
-    try {
-      await invoke("focus_simulator");
-    } catch (e) {
-      console.error("Failed to focus simulator:", e);
-    }
-  }, []);
-
-  // Auto-start observing when app starts running
+  // Auto-start observing when app starts running (but not after manual stop/discard)
   useEffect(() => {
-    if (isAppRunning && !isLiveMode && state !== "captured") {
+    if (isAppRunning && !isLiveMode && state !== "captured" && !manualStopFlag) {
       const timer = setTimeout(() => {
         startObserving();
       }, 500);
       return () => clearTimeout(timer);
     }
-  }, [isAppRunning, isLiveMode, state, startObserving]);
+  }, [isAppRunning, isLiveMode, state, manualStopFlag, startObserving]);
 
   // Listen for frame events when in live mode
   useEffect(() => {
@@ -369,7 +366,7 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
 
     const setupListener = async () => {
       const unlisten = await listen<ClaudeEvent>("claude-event", (event) => {
-        const { eventType, toolName } = event.payload;
+        const { eventType, toolName, content } = event.payload;
 
         if (eventType === "tool_use" && isSimulatorTool(toolName)) {
           setIsClaudeWatching(true);
@@ -379,6 +376,17 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
         if (eventType === "tool_result" || eventType === "result") {
           setIsClaudeWatching(false);
           setClaudeToolName(null);
+        }
+
+        // When the agent takes a screenshot, update the display to show what it sees
+        // This keeps the preview in sync with what Claude is actually seeing
+        if (eventType === "agent_screenshot" && content) {
+          console.log("[SimulatorPane] Received agent screenshot filepath:", content);
+          // Switch away from live mode to show the static screenshot
+          setIsLiveMode(false);
+          // Content now contains filepath, convert to asset URL
+          const assetUrl = convertFileSrc(content);
+          setScreenshotUrl(assetUrl);
         }
       });
       return unlisten;
@@ -402,7 +410,7 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
   return (
     <div className="flex flex-col h-full bg-surface-raised relative">
       {/* Main View */}
-      <div className="flex-1 flex items-center justify-center p-3 overflow-hidden">
+      <div className="flex-1 flex items-center justify-center p-3 min-h-0">
         {state === "disconnected" ? (
           <div className="text-center space-y-4">
             <div className="w-48 h-96 rounded-3xl border-2 border-dashed border-border flex items-center justify-center">
@@ -515,13 +523,13 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
           </div>
         ) : (
           // Running or Observing - show live feed
-          <div className="h-full flex items-center justify-center">
+          <div className="h-full w-full flex items-center justify-center overflow-hidden">
             {screenshotUrl ? (
-              <div className="relative h-full flex items-center justify-center">
+              <div className="relative h-full w-full flex items-center justify-center">
                 <img
                   src={screenshotUrl}
                   alt="Simulator"
-                  className="h-full max-h-[calc(100%-2rem)] w-auto object-contain rounded-[1.5rem] shadow-xl"
+                  className="max-h-full max-w-full w-auto h-auto object-contain rounded-[1.5rem] shadow-xl"
                 />
               </div>
             ) : isCapturing ? (
@@ -555,12 +563,6 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
           </div>
           <div className="flex items-center gap-1 shrink-0">
             <button
-              onClick={(e) => { e.preventDefault(); e.stopPropagation(); focusSimulator(); }}
-              className="px-2 py-1 text-[10px] rounded bg-white/20 hover:bg-white/30 text-white transition-colors active:scale-95"
-            >
-              Sim
-            </button>
-            <button
               onClick={(e) => { e.preventDefault(); e.stopPropagation(); stopObserving(); }}
               className="px-2 py-1 text-[10px] rounded bg-white text-error font-medium hover:bg-white/90 transition-colors active:scale-95"
             >
@@ -583,8 +585,8 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
       )}
 
       {/* Bottom toolbar */}
-      <div className="h-12 px-4 flex items-center justify-between border-t border-border bg-surface-raised/50">
-        <div className="flex items-center gap-2">
+      <div className="h-12 px-4 flex items-center justify-between gap-4 border-t border-border bg-surface-raised/50">
+        <div className="flex items-center gap-2 shrink-0">
           {state === "observing" ? (
             <>
               <div className="w-2 h-2 rounded-full bg-error animate-pulse" />
@@ -595,27 +597,37 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
               <div className="w-2 h-2 rounded-full bg-success" />
               <span className="text-xs text-success font-medium">Captured</span>
             </>
-          ) : (
+          ) : state === "disconnected" ? (
             <>
               <div className="w-1.5 h-1.5 rounded-full bg-text-tertiary" />
-              <span className="text-xs text-text-tertiary font-mono">
-                {state === "disconnected" ? "No Simulator" : "Ready"}
-              </span>
+              <span className="text-xs text-text-tertiary font-mono">No Simulator</span>
             </>
-          )}
+          ) : !isLiveMode && screenshotUrl ? (
+            <>
+              <div className="w-1.5 h-1.5 rounded-full bg-accent" />
+              <span className="text-xs text-accent font-mono">Agent View</span>
+            </>
+          ) : null}
           {windowInfo && isLiveMode && (
             <span className="text-xs text-text-tertiary ml-2">· {windowInfo.name}</span>
           )}
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 shrink-0">
           {state !== "observing" && state !== "captured" && (
             <>
-              <button
-                onClick={startObserving}
-                className="px-3 py-1.5 rounded text-xs bg-error/10 text-error hover:bg-error/20 transition-colors font-medium"
-              >
-                Start Recording
-              </button>
+              {isClaudeWatching ? (
+                <div className="px-3 py-1.5 rounded text-xs bg-accent/20 text-accent font-medium flex items-center gap-1.5">
+                  <div className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+                  Claude Active
+                </div>
+              ) : (
+                <button
+                  onClick={startObserving}
+                  className="px-3 py-1.5 rounded text-xs bg-error/10 text-error hover:bg-error/20 transition-colors font-medium"
+                >
+                  Start Recording
+                </button>
+              )}
               <div className="w-px h-4 bg-border mx-1"/>
             </>
           )}

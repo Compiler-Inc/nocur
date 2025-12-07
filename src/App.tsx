@@ -9,6 +9,7 @@ import { DiffViewer } from "@/components/DiffViewer";
 import { Onboarding } from "@/components/Onboarding";
 import { HistorySidebar } from "@/components/HistorySidebar";
 import { OpenInDropdown } from "@/components/OpenInDropdown";
+import { ContextReviewModal, RecordingData } from "@/components/ContextReviewModal";
 
 // DEBUG: Set to true to always show onboarding
 const DEBUG_SHOW_ONBOARDING = false;
@@ -124,6 +125,8 @@ const App = () => {
   // Pane widths - balanced like Conductor
   const [leftWidth, setLeftWidth] = useState(300);
   const [rightWidth, setRightWidth] = useState(320);
+  const [leftCollapsed, setLeftCollapsed] = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(true); // Hidden by default
 
   // Session state (shared with sidebar)
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -138,6 +141,10 @@ const App = () => {
   // Build state
   const [buildStatus, setBuildStatus] = useState<BuildStatus>("idle");
   const [buildTime, setBuildTime] = useState<number | null>(null);
+
+  // Context review modal state
+  const [showContextModal, setShowContextModal] = useState(false);
+  const [pendingRecording, setPendingRecording] = useState<RecordingData | null>(null);
 
   // Git info
   const [gitInfo, setGitInfo] = useState<GitInfo | null>(null);
@@ -299,6 +306,11 @@ const App = () => {
         e.preventDefault();
         setSelectedDiffFile(null);
       }
+      // Cmd+B: Toggle left sidebar
+      if (e.metaKey && e.key === "b") {
+        e.preventDefault();
+        setLeftCollapsed(prev => !prev);
+      }
     };
 
     window.addEventListener("keydown", handleKeyDown);
@@ -400,6 +412,85 @@ const App = () => {
     }
   };
 
+  // Handle sending context from review modal
+  const handleContextSend = async (
+    message: string,
+    selectedFrameIndices: number[],
+    includeLogs: boolean
+  ) => {
+    if (!pendingRecording) return;
+
+    // Get selected frames
+    const selectedFrames = selectedFrameIndices.map(i => pendingRecording.frames[i]).filter(Boolean);
+
+    // Save screenshots to temp files
+    let screenshotPaths: string[] = [];
+    if (selectedFrames.length > 0) {
+      try {
+        screenshotPaths = await invoke<string[]>("save_screenshots_to_temp", {
+          images: selectedFrames.map(f => f.image),
+          prefix: null
+        });
+        console.log(`Saved ${screenshotPaths.length} screenshots to temp files`);
+      } catch (e) {
+        console.error("Failed to save screenshots:", e);
+      }
+    }
+
+    // Build the full message
+    let fullMessage = message + "\n\n";
+
+    // Add screenshot paths for Claude to view
+    if (screenshotPaths.length > 0) {
+      fullMessage += `Here are ${screenshotPaths.length} screenshots from the recording. Please read these image files to see the app state:\n`;
+      screenshotPaths.forEach((path, i) => {
+        fullMessage += `- Frame ${i + 1}: ${path}\n`;
+      });
+      fullMessage += "\n";
+    }
+
+    // Add logs if requested
+    if (includeLogs) {
+      const errorLogs = pendingRecording.logs.filter(l => l.level === "error" || l.level === "fault");
+      if (errorLogs.length > 0) {
+        fullMessage += `${errorLogs.length} errors detected in logs:\n`;
+        errorLogs.slice(0, 10).forEach(log => {
+          fullMessage += `- [${log.process}] ${log.message.slice(0, 200)}\n`;
+        });
+        if (errorLogs.length > 10) {
+          fullMessage += `... and ${errorLogs.length - 10} more errors\n`;
+        }
+        fullMessage += "\n";
+      }
+    }
+
+    // Add crash info if any
+    if (pendingRecording.crashes.length > 0) {
+      fullMessage += `${pendingRecording.crashes.length} crash(es) detected:\n`;
+      pendingRecording.crashes.forEach(crash => {
+        fullMessage += `- ${crash.processName}: ${crash.exceptionType || "Unknown"}\n`;
+        if (crash.crashReason) {
+          fullMessage += `  Reason: ${crash.crashReason}\n`;
+        }
+        if (crash.stackTrace) {
+          fullMessage += `  Stack trace (first 500 chars): ${crash.stackTrace.slice(0, 500)}\n`;
+        }
+      });
+      fullMessage += "\n";
+    }
+
+    // Send to Claude
+    try {
+      await invoke("send_claude_message", { message: fullMessage });
+      console.log("Recording sent to Claude");
+    } catch (e) {
+      console.error("Failed to send recording to Claude:", e);
+    }
+
+    // Clear pending recording
+    setPendingRecording(null);
+  };
+
   // Handle window dragging programmatically
   const handleTitleBarMouseDown = (e: React.MouseEvent) => {
     // Don't drag if clicking on a button or interactive element
@@ -497,19 +588,44 @@ const App = () => {
         {/* Three Panes: History + Agent + Simulator */}
         <div className="flex flex-1 overflow-hidden">
           {/* Left Pane: History Sidebar */}
-          <div
-            style={{ width: leftWidth }}
-            className="flex flex-col shrink-0 overflow-hidden"
-          >
-            <HistorySidebar
-              currentSessionId={currentSessionId}
-              onSelectSession={handleSelectSession}
-              onNewSession={handleNewSession}
-              projectPath={PROJECT_PATH}
-            />
-          </div>
-
-          <ResizeHandle onResize={handleLeftResize} direction="left" />
+          {leftCollapsed ? (
+            <div className="w-10 flex flex-col shrink-0 bg-surface-raised border-r border-border">
+              <button
+                onClick={() => setLeftCollapsed(false)}
+                className="p-2 m-1 rounded hover:bg-hover text-text-tertiary hover:text-text-primary transition-colors"
+                title="Expand sidebar"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+            </div>
+          ) : (
+            <>
+              <div
+                style={{ width: leftWidth }}
+                className="flex flex-col shrink-0 overflow-hidden relative group"
+              >
+                <HistorySidebar
+                  currentSessionId={currentSessionId}
+                  onSelectSession={handleSelectSession}
+                  onNewSession={handleNewSession}
+                  projectPath={PROJECT_PATH}
+                />
+                {/* Collapse button - appears on hover */}
+                <button
+                  onClick={() => setLeftCollapsed(true)}
+                  className="absolute top-2 right-2 p-1 rounded bg-surface-overlay hover:bg-hover text-text-tertiary hover:text-text-primary transition-all opacity-0 group-hover:opacity-100"
+                  title="Collapse sidebar"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+                  </svg>
+                </button>
+              </div>
+              <ResizeHandle onResize={handleLeftResize} direction="left" />
+            </>
+          )}
 
           {/* Main Pane: Claude Agent or Diff Viewer */}
           <div className="flex-1 min-w-[400px] flex flex-col overflow-hidden bg-surface-base">
@@ -528,98 +644,46 @@ const App = () => {
             )}
           </div>
 
-          <ResizeHandle onResize={handleRightResize} direction="right" />
-
-          {/* Right Pane: Simulator */}
-          <div
-            style={{ width: rightWidth }}
-            className="flex flex-col shrink-0 overflow-hidden bg-surface-raised"
-          >
-            <SimulatorPane
-              isAppRunning={buildStatus === "success"}
-              onCapture={async (data) => {
-                console.log(`Recording captured:`, {
-                  frames: data.frames.length,
-                  logs: data.logs.length,
-                  crashes: data.crashes.length,
-                  duration: `${Math.round((data.endTime - data.startTime) / 1000)}s`
-                });
-
-                // Save key screenshots to temp files so Claude can view them
-                // Sample ~5 frames evenly distributed across the recording
-                const maxFramesToSend = 5;
-                const step = Math.max(1, Math.floor(data.frames.length / maxFramesToSend));
-                const selectedFrames = data.frames
-                  .filter((_, i) => i % step === 0)
-                  .slice(0, maxFramesToSend);
-
-                let screenshotPaths: string[] = [];
-                if (selectedFrames.length > 0) {
-                  try {
-                    screenshotPaths = await invoke<string[]>("save_screenshots_to_temp", {
-                      images: selectedFrames.map(f => f.image),
-                      prefix: null
-                    });
-                    console.log(`Saved ${screenshotPaths.length} screenshots to temp files`);
-                  } catch (e) {
-                    console.error("Failed to save screenshots:", e);
-                  }
-                }
-
-                // Build a message with the recording context
-                const duration = Math.round((data.endTime - data.startTime) / 1000);
-                const errorLogs = data.logs.filter(l => l.level === "error" || l.level === "fault");
-
-                let message = `I recorded the iOS simulator for ${duration}s (${data.frames.length} frames total).\n\n`;
-
-                // Add screenshot paths for Claude to view
-                if (screenshotPaths.length > 0) {
-                  message += `Here are ${screenshotPaths.length} screenshots from the recording. Please read these image files to see the app state:\n`;
-                  screenshotPaths.forEach((path, i) => {
-                    message += `- Frame ${i + 1}: ${path}\n`;
-                  });
-                  message += "\n";
-                }
-
-                // Add error summary if any
-                if (errorLogs.length > 0) {
-                  message += `${errorLogs.length} errors detected in logs:\n`;
-                  errorLogs.slice(0, 5).forEach(log => {
-                    message += `- [${log.process}] ${log.message.slice(0, 200)}\n`;
-                  });
-                  if (errorLogs.length > 5) {
-                    message += `... and ${errorLogs.length - 5} more errors\n`;
-                  }
-                  message += "\n";
-                }
-
-                // Add crash info if any
-                if (data.crashes.length > 0) {
-                  message += `${data.crashes.length} crash(es) detected:\n`;
-                  data.crashes.forEach(crash => {
-                    message += `- ${crash.processName}: ${crash.exceptionType || "Unknown"}\n`;
-                    if (crash.crashReason) {
-                      message += `  Reason: ${crash.crashReason}\n`;
-                    }
-                    if (crash.stackTrace) {
-                      message += `  Stack trace (first 500 chars): ${crash.stackTrace.slice(0, 500)}\n`;
-                    }
-                  });
-                  message += "\n";
-                }
-
-                message += "Please analyze ONLY what you can see in these screenshots. Do not assume features are broken just because they weren't demonstrated - focus on what IS visible and any actual errors in the logs.";
-
-                // Send to Claude
-                try {
-                  await invoke("send_claude_message", { message });
-                  console.log("Recording sent to Claude");
-                } catch (e) {
-                  console.error("Failed to send recording to Claude:", e);
-                }
-              }}
-            />
-          </div>
+          {/* Right Pane: Simulator (collapsible) */}
+          {rightCollapsed ? (
+            <div className="w-10 flex flex-col shrink-0 bg-surface-raised border-l border-border">
+              <button
+                onClick={() => setRightCollapsed(false)}
+                className="p-2 m-1 rounded hover:bg-hover text-text-tertiary hover:text-text-primary transition-colors"
+                title="Show simulator"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+                </svg>
+              </button>
+            </div>
+          ) : (
+            <>
+              <ResizeHandle onResize={handleRightResize} direction="right" />
+              <div
+                style={{ width: rightWidth }}
+                className="flex flex-col shrink-0 overflow-hidden bg-surface-raised relative group"
+              >
+                <SimulatorPane
+                  isAppRunning={buildStatus === "success"}
+                  onCapture={(data) => {
+                    setPendingRecording(data);
+                    setShowContextModal(true);
+                  }}
+                />
+                {/* Collapse button */}
+                <button
+                  onClick={() => setRightCollapsed(true)}
+                  className="absolute top-2 left-2 p-1 rounded bg-surface-overlay hover:bg-hover text-text-tertiary hover:text-text-primary transition-all opacity-0 group-hover:opacity-100 z-10"
+                  title="Hide simulator"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </div>
+            </>
+          )}
 
           {/* Dev Tools Pane - Version Control + Terminal */}
           {showDevTools && (
@@ -692,6 +756,17 @@ const App = () => {
           </div>
         )}
       </div>
+
+      {/* Context Review Modal */}
+      <ContextReviewModal
+        isOpen={showContextModal}
+        onClose={() => {
+          setShowContextModal(false);
+          setPendingRecording(null);
+        }}
+        onSend={handleContextSend}
+        recordingData={pendingRecording}
+      />
     </div>
   );
 };
