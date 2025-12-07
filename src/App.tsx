@@ -7,7 +7,6 @@ import { AgentPane } from "@/components/panes/AgentPane";
 import { DevToolsPane } from "@/components/panes/DevToolsPane";
 import { DiffViewer } from "@/components/DiffViewer";
 import { Onboarding } from "@/components/Onboarding";
-import { HistorySidebar } from "@/components/HistorySidebar";
 import { OpenInDropdown } from "@/components/OpenInDropdown";
 import { ContextReviewModal, RecordingData } from "@/components/ContextReviewModal";
 
@@ -122,16 +121,12 @@ const App = () => {
   const [isReady, setIsReady] = useState<boolean | null>(DEBUG_SHOW_ONBOARDING ? false : null);
   const [showOnboarding, setShowOnboarding] = useState(true);
 
-  // Pane widths - balanced like Conductor
-  const [leftWidth, setLeftWidth] = useState(300);
+  // Pane widths
   const [rightWidth, setRightWidth] = useState(320);
-  const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(true); // Hidden by default
 
-  // Session state (shared with sidebar)
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
-  const [pendingSessionAction, setPendingSessionAction] = useState<{ type: "resume" | "new"; sessionId?: string } | null>(null);
-  const [indexedSessions, setIndexedSessions] = useState<string[]>([]); // For Cmd+1,2,3
+  // Session state
+  const [_currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
   // Dev tools panel state
   const [showDevTools, setShowDevTools] = useState(false);
@@ -241,63 +236,19 @@ const App = () => {
     setIsReady(true);
   };
 
-  const handleLeftResize = useCallback((delta: number) => {
-    setLeftWidth((w) => Math.max(220, Math.min(360, w + delta)));
-  }, []);
-
   const handleRightResize = useCallback((delta: number) => {
     setRightWidth((w) => Math.max(280, Math.min(400, w + delta)));
-  }, []);
-
-  // Session action handlers for sidebar
-  const handleSelectSession = useCallback((sessionId: string) => {
-    setPendingSessionAction({ type: "resume", sessionId });
-  }, []);
-
-  const handleNewSession = useCallback(() => {
-    setPendingSessionAction({ type: "new" });
   }, []);
 
   const handleDevToolsResize = useCallback((delta: number) => {
     setDevToolsWidth((w) => Math.max(280, Math.min(600, w - delta)));
   }, []);
 
-  // Load indexed sessions for Cmd+1,2,3
-  useEffect(() => {
-    const loadSessions = async () => {
-      try {
-        const sessions = await invoke<{ sessionId: string }[]>("get_recent_sessions");
-        // Include current session first, then recent sessions
-        const sessionIds = sessions.map(s => s.sessionId);
-        if (currentSessionId && !sessionIds.includes(currentSessionId)) {
-          sessionIds.unshift(currentSessionId);
-        }
-        setIndexedSessions(sessionIds.slice(0, 9)); // Max 9 for Cmd+1-9
-      } catch (err) {
-        console.error("Failed to load sessions:", err);
-      }
-    };
-    loadSessions();
-  }, [currentSessionId]);
-
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Cmd+1-9: Switch sessions
-      if (e.metaKey && e.key >= "1" && e.key <= "9") {
-        const index = parseInt(e.key) - 1;
-        if (indexedSessions[index] && indexedSessions[index] !== currentSessionId) {
-          e.preventDefault();
-          setPendingSessionAction({ type: "resume", sessionId: indexedSessions[index] });
-        }
-      }
       // Cmd+Shift+E: Toggle dev tools
       if (e.metaKey && e.shiftKey && e.key === "e") {
-        e.preventDefault();
-        setShowDevTools(prev => !prev);
-      }
-      // Cmd+Shift+G: Toggle dev tools (git)
-      if (e.metaKey && e.shiftKey && e.key === "g") {
         e.preventDefault();
         setShowDevTools(prev => !prev);
       }
@@ -306,16 +257,11 @@ const App = () => {
         e.preventDefault();
         setSelectedDiffFile(null);
       }
-      // Cmd+B: Toggle left sidebar
-      if (e.metaKey && e.key === "b") {
-        e.preventDefault();
-        setLeftCollapsed(prev => !prev);
-      }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [indexedSessions, currentSessionId, selectedDiffFile]);
+  }, [selectedDiffFile]);
 
   // Build handlers
   const handleBuild = async () => {
@@ -585,48 +531,8 @@ const App = () => {
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Three Panes: History + Agent + Simulator */}
+        {/* Main Content */}
         <div className="flex flex-1 overflow-hidden">
-          {/* Left Pane: History Sidebar */}
-          {leftCollapsed ? (
-            <div className="w-10 flex flex-col shrink-0 bg-surface-raised border-r border-border">
-              <button
-                onClick={() => setLeftCollapsed(false)}
-                className="p-2 m-1 rounded hover:bg-hover text-text-tertiary hover:text-text-primary transition-colors"
-                title="Expand sidebar"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                </svg>
-              </button>
-            </div>
-          ) : (
-            <>
-              <div
-                style={{ width: leftWidth }}
-                className="flex flex-col shrink-0 overflow-hidden relative group"
-              >
-                <HistorySidebar
-                  currentSessionId={currentSessionId}
-                  onSelectSession={handleSelectSession}
-                  onNewSession={handleNewSession}
-                  projectPath={PROJECT_PATH}
-                />
-                {/* Collapse button - appears on hover */}
-                <button
-                  onClick={() => setLeftCollapsed(true)}
-                  className="absolute top-2 right-2 p-1 rounded bg-surface-overlay hover:bg-hover text-text-tertiary hover:text-text-primary transition-all opacity-0 group-hover:opacity-100"
-                  title="Collapse sidebar"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
-                  </svg>
-                </button>
-              </div>
-              <ResizeHandle onResize={handleLeftResize} direction="left" />
-            </>
-          )}
-
           {/* Main Pane: Claude Agent or Diff Viewer */}
           <div className="flex-1 min-w-[400px] flex flex-col overflow-hidden bg-surface-base">
             {selectedDiffFile ? (
@@ -638,8 +544,6 @@ const App = () => {
             ) : (
               <AgentPane
                 onSessionChange={setCurrentSessionId}
-                pendingSessionAction={pendingSessionAction}
-                onPendingSessionActionHandled={() => setPendingSessionAction(null)}
               />
             )}
           </div>
