@@ -244,8 +244,8 @@ const App = () => {
         e.preventDefault();
         setShowBottomPanel(prev => !prev);
       }
-      // Cmd+`: Toggle terminal (alternative)
-      if (e.metaKey && e.key === "`") {
+      // Ctrl+`: Toggle terminal (VSCode style)
+      if (e.ctrlKey && e.key === "`") {
         e.preventDefault();
         setShowBottomPanel(prev => !prev);
       }
