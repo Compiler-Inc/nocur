@@ -151,21 +151,27 @@ public final class SimulatorController {
         let (width, height) = try getImageDimensions(path: path)
 
         if base64Output {
-            // Read file and encode to base64
+            // Read file and compress for smaller context size
             guard let data = FileManager.default.contents(atPath: path) else {
                 throw NocurError.notFound("Screenshot file not found")
             }
-            let base64String = data.base64EncodedString()
+
+            // Resize and compress to reduce context usage (~150KB -> ~30KB)
+            let compressedData = compressImageForContext(data: data, maxWidth: 600, jpegQuality: 0.5)
+            let base64String = compressedData.base64EncodedString()
+
+            // Get new dimensions after resize
+            let (newWidth, newHeight) = getCompressedDimensions(originalWidth: width, originalHeight: height, maxWidth: 600)
 
             // Clean up temp file
             try? FileManager.default.removeItem(atPath: path)
 
             return ScreenshotResult(
-                base64: "data:image/\(format);base64,\(base64String)",
-                width: width,
-                height: height,
+                base64: "data:image/jpeg;base64,\(base64String)",
+                width: newWidth,
+                height: newHeight,
                 simulator: simName,
-                format: format
+                format: "jpeg"
             )
         }
 
@@ -499,5 +505,45 @@ public final class SimulatorController {
         }
 
         return (width, height)
+    }
+
+    /// Compress image using sips command line tool (always available on macOS)
+    /// Resizes to maxWidth and recompresses JPEG
+    private func compressImageForContext(data: Data, maxWidth: Int, jpegQuality: Double) -> Data {
+        // Write to temp file, use sips to resize, read back
+        let tempInput = FileManager.default.temporaryDirectory
+            .appendingPathComponent("compress_in_\(UUID().uuidString).jpg")
+        let tempOutput = FileManager.default.temporaryDirectory
+            .appendingPathComponent("compress_out_\(UUID().uuidString).jpg")
+
+        defer {
+            try? FileManager.default.removeItem(at: tempInput)
+            try? FileManager.default.removeItem(at: tempOutput)
+        }
+
+        do {
+            try data.write(to: tempInput)
+
+            // Resize with sips (uses ImageIO, very efficient)
+            _ = try shellSync("sips", "--resampleWidth", "\(maxWidth)", tempInput.path, "--out", tempOutput.path)
+
+            // Read compressed result
+            if let compressedData = FileManager.default.contents(atPath: tempOutput.path) {
+                return compressedData
+            }
+        } catch {
+            // On any error, return original
+        }
+
+        return data
+    }
+
+    /// Calculate new dimensions after resize
+    private func getCompressedDimensions(originalWidth: Int, originalHeight: Int, maxWidth: Int) -> (Int, Int) {
+        if originalWidth <= maxWidth {
+            return (originalWidth, originalHeight)
+        }
+        let scale = Double(maxWidth) / Double(originalWidth)
+        return (maxWidth, Int(Double(originalHeight) * scale))
     }
 }

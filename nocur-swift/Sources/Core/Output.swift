@@ -566,3 +566,51 @@ public struct SchemesResult: Encodable {
         self.schemes = schemes
     }
 }
+
+// MARK: - Project Modification Models
+
+public struct AddedFileInfo: Encodable {
+    public let path: String
+    public let name: String
+    public let added: Bool
+    public let reason: String?
+
+    public init(path: String, name: String, added: Bool, reason: String?) {
+        self.path = path
+        self.name = name
+        self.added = added
+        self.reason = reason
+    }
+}
+
+public struct AddFilesResult: Encodable {
+    public let project: String
+    public let target: String
+    public let files: [AddedFileInfo]
+    public let addedCount: Int
+
+    public init(project: String, target: String, files: [AddedFileInfo], addedCount: Int) {
+        self.project = project
+        self.target = target
+        self.files = files
+        self.addedCount = addedCount
+    }
+}
+
+// MARK: - App Run Result
+
+public struct RunResult: Encodable {
+    public let bundleId: String
+    public let pid: Int
+    public let simulator: String
+    public let buildTime: Double
+    public let rebuilt: Bool
+
+    public init(bundleId: String, pid: Int, simulator: String, buildTime: Double, rebuilt: Bool) {
+        self.bundleId = bundleId
+        self.pid = pid
+        self.simulator = simulator
+        self.buildTime = buildTime
+        self.rebuilt = rebuilt
+    }
+}

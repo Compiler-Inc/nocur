@@ -6,12 +6,13 @@ struct Project: AsyncParsableCommand {
         commandName: "project",
         abstract: "Xcode project utilities",
         discussion: """
-            Commands for detecting and inspecting Xcode projects.
+            Commands for detecting, inspecting, and modifying Xcode projects.
             """,
         subcommands: [
             Detect.self,
             Info.self,
-            Schemes.self
+            Schemes.self,
+            AddFiles.self
         ],
         defaultSubcommand: Detect.self
     )
@@ -124,6 +125,67 @@ extension Project {
             let detector = ProjectDetector()
             let result = try await detector.listSchemes(path: project)
             print(Output.success(result).json)
+        }
+    }
+}
+
+// MARK: - Add Files
+
+extension Project {
+    struct AddFiles: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "add-files",
+            abstract: "Add files to Xcode project",
+            discussion: """
+                Adds source files to an Xcode project and target.
+                This is essential after creating new Swift files - they won't
+                appear in Xcode until added to the project.
+
+                Example:
+                  nocur-swift project add-files MyView.swift
+                  nocur-swift project add-files File1.swift File2.swift --target MyApp
+                  nocur-swift project add-files Views/*.swift --group Sources/Views
+
+                Example output:
+                {
+                  "success": true,
+                  "data": {
+                    "project": "/path/to/MyApp.xcodeproj",
+                    "target": "MyApp",
+                    "files": [
+                      {"path": "MyView.swift", "name": "MyView.swift", "added": true}
+                    ],
+                    "addedCount": 1
+                  }
+                }
+                """
+        )
+
+        @Argument(help: "File paths to add")
+        var files: [String]
+
+        @Option(name: .shortAndLong, help: "Path to .xcodeproj (auto-detects if not specified)")
+        var project: String?
+
+        @Option(name: .shortAndLong, help: "Target name (uses first target if not specified)")
+        var target: String?
+
+        @Option(name: .shortAndLong, help: "Group path in project (e.g., 'Sources/Views')")
+        var group: String?
+
+        func run() async throws {
+            let modifier = ProjectModifier()
+            do {
+                let result = try await modifier.addFiles(
+                    files,
+                    projectPath: project,
+                    targetName: target,
+                    groupPath: group
+                )
+                print(Output.success(result).json)
+            } catch {
+                print(Output<AddFilesResult>.failure(error.localizedDescription).json)
+            }
         }
     }
 }

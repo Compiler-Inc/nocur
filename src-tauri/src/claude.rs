@@ -6,6 +6,20 @@ use std::thread;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
+/// Safely truncate a string at a character boundary
+/// This avoids panicking when the target byte index is in the middle of a multi-byte UTF-8 char
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Find the largest char boundary <= max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Events emitted to the frontend
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +53,16 @@ pub struct ClaudeEvent {
     pub duration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_turns: Option<u32>,
+    // Tool progress fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_step: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_message: Option<String>,
+    // Result subtype (e.g., "error_max_turns", "end_turn")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_subtype: Option<String>,
 }
 
 impl Default for ClaudeEvent {
@@ -61,6 +85,10 @@ impl Default for ClaudeEvent {
             cost: None,
             duration: None,
             num_turns: None,
+            progress_step: None,
+            progress_total: None,
+            progress_message: None,
+            result_subtype: None,
         }
     }
 }
@@ -199,7 +227,9 @@ impl ClaudeSession {
             for line in reader.lines() {
                 match line {
                     Ok(line) if !line.trim().is_empty() => {
-                        log::debug!("Service stdout: {}", &line[..std::cmp::min(200, line.len())]);
+                        // Truncate at char boundary to avoid panic with multi-byte UTF-8 chars
+                        let truncated = truncate_to_char_boundary(&line, 200);
+                        log::debug!("Service stdout: {}", truncated);
 
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                             if let Some(event) = parse_service_event(&json, &line) {
@@ -208,7 +238,8 @@ impl ClaudeSession {
                                 let _ = app_stdout.emit("claude-event", event);
                             }
                         } else {
-                            log::warn!("Failed to parse JSON: {}", &line[..std::cmp::min(100, line.len())]);
+                            let truncated = truncate_to_char_boundary(&line, 100);
+                            log::warn!("Failed to parse JSON: {}", truncated);
                         }
                     }
                     Ok(_) => {} // Empty line, skip
@@ -298,7 +329,7 @@ impl ClaudeSession {
     }
 
     pub fn send_message(&self, message: &str, app_handle: AppHandle) -> Result<(), String> {
-        log::info!("Sending message to Claude: {}", &message[..std::cmp::min(100, message.len())]);
+        log::info!("Sending message to Claude: {}", truncate_to_char_boundary(message, 100));
 
         let cmd = ServiceCommand::Message {
             content: message.to_string(),
@@ -379,23 +410,20 @@ impl ClaudeSession {
     pub fn stop(&self) {
         log::info!("Stopping Claude SDK service");
 
-        // Try to send stop command gracefully
-        if let Ok(mut guard) = self.stdin_writer.lock() {
-            if let Some(ref mut stdin) = *guard {
-                if let Ok(cmd) = serde_json::to_string(&ServiceCommand::Stop) {
-                    let _ = writeln!(stdin, "{}", cmd);
-                    let _ = stdin.flush();
-                }
+        // Kill the child process FIRST for immediate termination
+        // Don't wait for graceful shutdown - user wants it stopped NOW
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(ref mut child) = *guard {
+                log::info!("Killing child process");
+                let _ = child.kill();
+                // Don't call child.wait() here - it blocks!
+                // The process will be reaped automatically on drop or by the OS
             }
             *guard = None;
         }
 
-        // Kill the child process
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(ref mut child) = *guard {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        // Close stdin to signal the process should exit
+        if let Ok(mut guard) = self.stdin_writer.lock() {
             *guard = None;
         }
     }
@@ -508,6 +536,23 @@ fn parse_service_event(json: &serde_json::Value, raw_line: &str) -> Option<Claud
                 ..Default::default()
             })
         }
+        "usage" => {
+            // Token usage update during streaming
+            let input_tokens = json.get("inputTokens").and_then(|v| v.as_u64());
+            let output_tokens = json.get("outputTokens").and_then(|v| v.as_u64());
+            let cache_read_tokens = json.get("cacheReadTokens").and_then(|v| v.as_u64());
+            let cache_creation_tokens = json.get("cacheCreationTokens").and_then(|v| v.as_u64());
+
+            Some(ClaudeEvent {
+                event_type: "usage".to_string(),
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                raw_json: Some(raw_line.to_string()),
+                ..Default::default()
+            })
+        }
         "result" => {
             let content = json.get("content")
                 .and_then(|c| c.as_str())
@@ -533,6 +578,11 @@ fn parse_service_event(json: &serde_json::Value, raw_line: &str) -> Option<Claud
             let duration = json.get("duration").and_then(|d| d.as_f64());
             let num_turns = json.get("numTurns").and_then(|n| n.as_u64()).map(|n| n as u32);
 
+            // Extract result subtype (e.g., "error_max_turns", "end_turn")
+            let result_subtype = json.get("subtype")
+                .and_then(|s| s.as_str())
+                .map(String::from);
+
             Some(ClaudeEvent {
                 event_type: "result".to_string(),
                 content,
@@ -543,6 +593,7 @@ fn parse_service_event(json: &serde_json::Value, raw_line: &str) -> Option<Claud
                 cost,
                 duration,
                 num_turns,
+                result_subtype,
                 raw_json: Some(raw_line.to_string()),
                 ..Default::default()
             })
@@ -581,10 +632,46 @@ fn parse_service_event(json: &serde_json::Value, raw_line: &str) -> Option<Claud
                 ..Default::default()
             })
         }
+        "agent_screenshot" => {
+            // When the agent takes a screenshot, pass the filepath to the frontend
+            // Frontend uses convertFileSrc to load the image
+            let filepath = json.get("filepath")
+                .and_then(|f| f.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(ClaudeEvent {
+                event_type: "agent_screenshot".to_string(),
+                content: filepath.clone(),  // filepath for frontend to use with convertFileSrc
+                tool_input: Some(filepath),  // also in tool_input for reference
+                raw_json: Some(raw_line.to_string()),
+                ..Default::default()
+            })
+        }
         "stopped" => {
             Some(ClaudeEvent {
                 event_type: "stopped".to_string(),
                 content: "Service stopped".to_string(),
+                raw_json: Some(raw_line.to_string()),
+                ..Default::default()
+            })
+        }
+        "tool_progress" => {
+            let tool_name = json.get("toolName")
+                .and_then(|n| n.as_str())
+                .map(String::from);
+            let step = json.get("step").and_then(|s| s.as_u64()).map(|s| s as u32);
+            let total = json.get("total").and_then(|t| t.as_u64()).map(|t| t as u32);
+            let message = json.get("message")
+                .and_then(|m| m.as_str())
+                .map(String::from);
+
+            Some(ClaudeEvent {
+                event_type: "tool_progress".to_string(),
+                content: String::new(),
+                tool_name,
+                progress_step: step,
+                progress_total: total,
+                progress_message: message,
                 raw_json: Some(raw_line.to_string()),
                 ..Default::default()
             })

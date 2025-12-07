@@ -7,7 +7,7 @@ struct Sim: AsyncParsableCommand {
         abstract: "iOS Simulator control",
         discussion: """
             Commands for managing iOS Simulators: listing available devices,
-            booting/shutting down simulators, and capturing screenshots.
+            booting/shutting down simulators, capturing screenshots, and streaming logs.
             """,
         subcommands: [
             List.self,
@@ -16,7 +16,8 @@ struct Sim: AsyncParsableCommand {
             Screenshot.self,
             Observe.self,
             Diff.self,
-            Status.self
+            Status.self,
+            Logs.self
         ],
         defaultSubcommand: List.self
     )
@@ -294,6 +295,71 @@ extension Sim {
         func run() async throws {
             let controller = SimulatorController()
             let result = try await controller.getStatus()
+            print(Output.success(result).json)
+        }
+    }
+}
+
+// MARK: - Logs
+
+extension Sim {
+    struct Logs: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Capture simulator logs",
+            discussion: """
+                Captures logs from the iOS simulator using idb.
+                Filter by bundle ID or process name for focused output.
+
+                Example:
+                  nocur-swift sim logs --bundle-id com.example.app --duration 5
+                  nocur-swift sim logs --process MyApp --level debug
+
+                Output:
+                {
+                  "success": true,
+                  "data": {
+                    "logs": [
+                      {
+                        "timestamp": "2024-01-15T10:30:45.123Z",
+                        "level": "default",
+                        "process": "MyApp",
+                        "message": "User tapped button",
+                        "subsystem": "com.example.app",
+                        "category": "UI"
+                      }
+                    ],
+                    "count": 42,
+                    "duration": 5.0,
+                    "filter": "processImagePath contains 'com.example.app'"
+                  }
+                }
+                """
+        )
+
+        @Argument(help: "Simulator UDID (uses booted if omitted)")
+        var udid: String?
+
+        @Option(name: .shortAndLong, help: "Filter by bundle ID")
+        var bundleId: String?
+
+        @Option(name: .shortAndLong, help: "Filter by process name")
+        var process: String?
+
+        @Option(name: .shortAndLong, help: "Capture duration in seconds (max 30)")
+        var duration: Double = 5.0
+
+        @Option(name: .shortAndLong, help: "Log level: default, info, debug")
+        var level: String = "default"
+
+        func run() async throws {
+            let capture = LogCapture()
+            let result = try await capture.captureLogs(
+                bundleId: bundleId,
+                processName: process,
+                simulatorUDID: udid,
+                duration: duration,
+                level: level
+            )
             print(Output.success(result).json)
         }
     }

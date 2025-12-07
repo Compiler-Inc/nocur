@@ -1,10 +1,10 @@
 import SwiftUI
 
 @main
-struct NocurTestAppApp: App {
+struct ChatApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ChatView()
         }
     }
 }

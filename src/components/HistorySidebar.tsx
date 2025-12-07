@@ -309,9 +309,15 @@ export const HistorySidebar = ({
         </button>
       </div>
 
-      {/* History Panel */}
+      {/* History Panel with backdrop for click-outside dismiss */}
       {showHistory && (
-        <div className="absolute bottom-14 left-2 right-2 bg-surface-overlay border border-border rounded-lg shadow-lg p-3 max-h-72 overflow-auto">
+        <>
+          {/* Invisible backdrop to catch outside clicks */}
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => setShowHistory(false)}
+          />
+          <div className="absolute bottom-14 left-2 right-2 bg-surface-overlay border border-border rounded-lg shadow-lg p-3 max-h-72 overflow-auto z-50">
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm font-medium text-text-primary">Session History</span>
             <button
@@ -372,6 +378,7 @@ export const HistorySidebar = ({
             </div>
           )}
         </div>
+        </>
       )}
     </div>
   );

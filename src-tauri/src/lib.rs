@@ -2728,6 +2728,7 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_pty::init())
         .manage(Mutex::new(ClaudeState::new()))
         .manage(Mutex::new(PermissionState::new()));
 

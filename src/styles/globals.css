@@ -77,6 +77,13 @@
     @apply border-border;
   }
 
+  /* CRITICAL: Prevent page-level scrolling - only individual panes should scroll */
+  html, body, #root {
+    @apply h-full w-full overflow-hidden;
+    margin: 0;
+    padding: 0;
+  }
+
   body {
     @apply bg-surface-base text-text-primary font-sans antialiased;
     font-feature-settings: "rlig" 1, "calt" 1;

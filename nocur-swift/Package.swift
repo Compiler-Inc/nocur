@@ -12,7 +12,8 @@ let package = Package(
         .library(name: "NocurCore", targets: ["Core"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0")
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
+        .package(url: "https://github.com/tuist/XcodeProj.git", from: "8.16.0")
     ],
     targets: [
         .executableTarget(
@@ -24,7 +25,9 @@ let package = Package(
         ),
         .target(
             name: "Core",
-            dependencies: []
+            dependencies: [
+                .product(name: "XcodeProj", package: "XcodeProj")
+            ]
         ),
         .testTarget(
             name: "NocurTests",

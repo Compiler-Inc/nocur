@@ -20,15 +20,15 @@ public final class UIInteractor {
     ) async throws -> TapResult {
         let udid = try await resolveSimulator(simulatorUDID)
 
-        // idb uses logical points directly (not device pixels)
-        // iPhone 16 Pro: device resolution 1206x2622, logical 393x852 (3x scale)
-        let scale: Double = 3.0
-        let logicalX = Int(x / scale)
-        let logicalY = Int(y / scale)
+        // idb uses logical points (not device pixels)
+        // All coordinates from ui_hierarchy are already in logical points
+        // No scaling needed - pass through directly
+        let tapX = Int(x)
+        let tapY = Int(y)
 
         // Use idb for reliable touch input
         for _ in 0..<tapCount {
-            _ = try await shell("idb", "ui", "tap", "--udid", udid, String(logicalX), String(logicalY))
+            _ = try await shell("idb", "ui", "tap", "--udid", udid, String(tapX), String(tapY))
         }
 
         return TapResult(x: x, y: y, element: nil)
@@ -51,10 +51,16 @@ public final class UIInteractor {
         )
 
         guard let element = result.matches.first else {
-            throw NocurError.notFound("Element not found: \(identifier)")
+            // Get available elements to help agent
+            let available = try await getAvailableElements(inspector: inspector, udid: udid)
+            throw NocurError.notFound(
+                "Element not found with identifier: '\(identifier)'. " +
+                "Available identifiers: \(available.identifiers.prefix(10).joined(separator: ", "))" +
+                (available.identifiers.count > 10 ? " (and \(available.identifiers.count - 10) more)" : "")
+            )
         }
 
-        // Calculate center point
+        // Calculate center point - idb returns logical coordinates
         let x = element.frame.x + element.frame.width / 2
         let y = element.frame.y + element.frame.height / 2
 
@@ -78,10 +84,16 @@ public final class UIInteractor {
         )
 
         guard let element = result.matches.first else {
-            throw NocurError.notFound("Element not found with label: \(label)")
+            // Get available elements to help agent
+            let available = try await getAvailableElements(inspector: inspector, udid: udid)
+            throw NocurError.notFound(
+                "Element not found with label: '\(label)'. " +
+                "Available labels: \(available.labels.prefix(10).joined(separator: ", "))" +
+                (available.labels.count > 10 ? " (and \(available.labels.count - 10) more)" : "")
+            )
         }
 
-        // Calculate center point
+        // Calculate center point - idb returns logical coordinates
         let x = element.frame.x + element.frame.width / 2
         let y = element.frame.y + element.frame.height / 2
 
@@ -98,29 +110,26 @@ public final class UIInteractor {
     ) async throws -> ScrollResult {
         let udid = try await resolveSimulator(simulatorUDID)
 
-        // Calculate swipe coordinates using idb
-        // Start from center of screen
-        let scale: Double = 3.0
-        let centerX = 603 / scale  // ~201 logical points
-        let centerY = 1311 / scale // ~437 logical points
-
-        let swipeAmount = amount / scale
+        // Calculate swipe coordinates using idb (logical points)
+        // iPhone 16 Pro logical size: ~393x852
+        let centerX = 196.0  // Center X in logical points
+        let centerY = 426.0  // Center Y in logical points
 
         var endX = centerX
         var endY = centerY
 
         switch direction {
         case .up:
-            endY = centerY - swipeAmount
+            endY = centerY - amount
         case .down:
-            endY = centerY + swipeAmount
+            endY = centerY + amount
         case .left:
-            endX = centerX - swipeAmount
+            endX = centerX - amount
         case .right:
-            endX = centerX + swipeAmount
+            endX = centerX + amount
         }
 
-        // Use idb swipe
+        // Use idb swipe (expects logical points)
         _ = try await shell(
             "idb", "ui", "swipe",
             "--udid", udid,
@@ -215,27 +224,82 @@ public final class UIInteractor {
 
     // MARK: - Helpers
 
+    /// Track which simulators we've connected to avoid redundant connect calls
+    private static var connectedSimulators: Set<String> = []
+
+    /// Ensure idb is connected to the simulator before performing any operations
+    private func ensureIdbConnected(_ udid: String) async throws {
+        // Skip if already connected in this session
+        if UIInteractor.connectedSimulators.contains(udid) {
+            return
+        }
+
+        // Connect idb to the simulator
+        _ = try? await shell("idb", "connect", udid)
+        UIInteractor.connectedSimulators.insert(udid)
+    }
+
     private func resolveSimulator(_ udid: String?) async throws -> String {
+        let resolvedUdid: String
+
         if let udid = udid {
-            return udid
+            resolvedUdid = udid
+        } else {
+            let output = try await shell("xcrun", "simctl", "list", "devices", "booted", "-j")
+
+            guard let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let devices = json["devices"] as? [String: [[String: Any]]] else {
+                throw NocurError.notFound("No booted simulator found")
+            }
+
+            var foundUdid: String?
+            for (_, deviceList) in devices {
+                if let device = deviceList.first, let udid = device["udid"] as? String {
+                    foundUdid = udid
+                    break
+                }
+            }
+
+            guard let udid = foundUdid else {
+                throw NocurError.notFound("No booted simulator found")
+            }
+            resolvedUdid = udid
         }
 
-        let output = try await shell("xcrun", "simctl", "list", "devices", "booted", "-j")
+        // Auto-connect idb to the simulator
+        try await ensureIdbConnected(resolvedUdid)
 
-        guard let data = output.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let devices = json["devices"] as? [String: [[String: Any]]] else {
-            throw NocurError.notFound("No booted simulator found")
-        }
+        return resolvedUdid
+    }
 
-        for (_, deviceList) in devices {
-            if let device = deviceList.first, let udid = device["udid"] as? String {
-                return udid
+    /// Helper to get available elements for error messages
+    private func getAvailableElements(inspector: ViewInspector, udid: String) async throws -> AvailableElements {
+        let result = try await inspector.captureAccessibilityTree(
+            simulatorUDID: udid,
+            includeNonAccessible: false
+        )
+
+        var identifiers: [String] = []
+        var labels: [String] = []
+
+        for element in result.elements {
+            if let id = element.identifier, !id.isEmpty {
+                identifiers.append(id)
+            }
+            if let label = element.label, !label.isEmpty {
+                labels.append(label)
             }
         }
 
-        throw NocurError.notFound("No booted simulator found")
+        return AvailableElements(identifiers: identifiers, labels: labels)
     }
+}
+
+/// Helper struct for available elements
+private struct AvailableElements {
+    let identifiers: [String]
+    let labels: [String]
 }
 
 /// Action types for compound interact command
