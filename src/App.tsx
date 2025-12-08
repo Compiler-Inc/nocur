@@ -9,7 +9,7 @@ import { DiffViewer } from "@/components/DiffViewer";
 import { Onboarding } from "@/components/Onboarding";
 import { OpenInDropdown } from "@/components/OpenInDropdown";
 import { ContextReviewModal, RecordingData } from "@/components/ContextReviewModal";
-import { BottomPanel } from "@/components/BottomPanel";
+import { BottomPanel, BottomPanelHandle } from "@/components/BottomPanel";
 
 // DEBUG: Set to true to always show onboarding
 const DEBUG_SHOW_ONBOARDING = false;
@@ -149,6 +149,7 @@ const App = () => {
   const [showBottomPanel, setShowBottomPanel] = useState(false);
   const [buildLogs, setBuildLogs] = useState<LogEntry[]>([]);
   const [bottomPanelHeight, setBottomPanelHeight] = useState(220);
+  const bottomPanelRef = useRef<BottomPanelHandle>(null);
 
   // Fetch git info
   useEffect(() => {
@@ -245,9 +246,18 @@ const App = () => {
         setShowBottomPanel(prev => !prev);
       }
       // Ctrl+`: Toggle terminal (VSCode style)
-      if (e.ctrlKey && e.key === "`") {
+      if (e.ctrlKey && !e.shiftKey && e.key === "`") {
         e.preventDefault();
         setShowBottomPanel(prev => !prev);
+      }
+      // Ctrl+Shift+`: New terminal (VSCode style)
+      if (e.ctrlKey && e.shiftKey && e.key === "`") {
+        e.preventDefault();
+        setShowBottomPanel(true);
+        // Use setTimeout to ensure the panel is rendered before calling addTerminal
+        setTimeout(() => {
+          bottomPanelRef.current?.addTerminal();
+        }, 0);
       }
       // Cmd+B: Toggle right sidebar (simulator)
       if (e.metaKey && !e.shiftKey && e.key === "b") {
@@ -584,6 +594,7 @@ const App = () => {
         {/* Bottom Panel - Terminal + Build Logs */}
         {showBottomPanel && (
           <BottomPanel
+            ref={bottomPanelRef}
             height={bottomPanelHeight}
             onHeightChange={setBottomPanelHeight}
             onClose={() => setShowBottomPanel(false)}

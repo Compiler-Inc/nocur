@@ -2719,6 +2719,11 @@ async fn run_terminal_command(command: String, working_dir: String) -> Result<Te
     })
 }
 
+#[tauri::command]
+fn get_shell_env() -> std::collections::HashMap<String, String> {
+    std::env::vars().collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "macos")]
@@ -2729,6 +2734,7 @@ pub fn run() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_pty::init())
+        .plugin(tauri_plugin_os::init())
         .manage(Mutex::new(ClaudeState::new()))
         .manage(Mutex::new(PermissionState::new()));
 
@@ -2801,6 +2807,7 @@ pub fn run() {
             set_active_session,
             // Terminal
             run_terminal_command,
+            get_shell_env,
             // Window capture (macOS only)
             #[cfg(target_os = "macos")]
             start_simulator_stream,
