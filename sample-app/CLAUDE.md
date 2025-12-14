@@ -3,16 +3,33 @@
 ## Project Overview
 SwiftUI app for testing iOS 26 Foundation Models API integration.
 
+## Project Structure (Tuist)
+This project uses **Tuist** for Xcode project generation. The xcodeproj is generated from `Project.swift`, which means:
+- **New Swift files are automatically included** - just create files in the appropriate directory
+- **No need to manually edit the xcodeproj** - Tuist regenerates it on build
+- Run `tuist generate` manually if you need to open in Xcode
+
+### Key Files
+- `Project.swift` - Tuist manifest defining the project structure
+- `Tuist.swift` - Tuist configuration
+- `NocurTestApp/` - All source files (auto-discovered by Tuist)
+
 ## Build Commands
+Nocur automatically runs `tuist generate` before building when it detects a `Project.swift` file.
+
 ```bash
-# Build
+# Build (Tuist generate happens automatically)
 nocur-swift app build
 
 # Launch
-nocur-swift app launch --bundle-id com.nocur.NocurTestApp
+nocur-swift app launch --bundle-id com.nocur.testapp
 
 # Kill
-nocur-swift app kill --bundle-id com.nocur.NocurTestApp
+nocur-swift app kill --bundle-id com.nocur.testapp
+
+# Manual Tuist commands (if needed)
+cd sample-app && tuist generate
+cd sample-app && tuist edit  # Edit Project.swift in Xcode
 ```
 
 ## Verification Commands

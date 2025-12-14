@@ -14,7 +14,8 @@ class ChatViewModel: ObservableObject {
     private var currentModelService: AIModelService
 
     init() {
-        self.currentModelService = AIModelFactory.createModel(for: selectedModel)
+        // Initialize model service with the default model type
+        self.currentModelService = AIModelFactory.createModel(for: .appleFoundation)
         addWelcomeMessage()
     }
 

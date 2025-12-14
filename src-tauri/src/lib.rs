@@ -203,6 +203,127 @@ fn parse_build_errors(output: &str) -> (Vec<BuildError>, u32) {
 }
 
 // =============================================================================
+// Physical Device Helpers
+// =============================================================================
+
+/// Result of checking physical device availability
+enum DeviceAvailability {
+    Available,
+    TunnelUnavailable,
+    NotPaired,
+    NotFound,
+}
+
+/// Check if a physical device is available and ready for install/launch
+fn check_physical_device_availability(device_id: &str) -> DeviceAvailability {
+    // Create temp file for JSON output
+    let temp_file = std::env::temp_dir().join(format!("devicectl_check_{}.json", std::process::id()));
+    
+    let output = Command::new("xcrun")
+        .args(["devicectl", "list", "devices", "--json-output", temp_file.to_str().unwrap_or("")])
+        .output();
+    
+    let result = match output {
+        Ok(out) if out.status.success() => {
+            // Read and parse the JSON output
+            if let Ok(data) = std::fs::read_to_string(&temp_file) {
+                parse_device_availability(&data, device_id)
+            } else {
+                DeviceAvailability::NotFound
+            }
+        }
+        _ => DeviceAvailability::NotFound,
+    };
+    
+    // Clean up temp file
+    let _ = std::fs::remove_file(&temp_file);
+    
+    result
+}
+
+/// Parse devicectl JSON output to determine device availability
+fn parse_device_availability(json_str: &str, device_id: &str) -> DeviceAvailability {
+    let json: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return DeviceAvailability::NotFound,
+    };
+    
+    let devices = json
+        .get("result")
+        .and_then(|r| r.get("devices"))
+        .and_then(|d| d.as_array());
+    
+    let Some(devices) = devices else {
+        return DeviceAvailability::NotFound;
+    };
+    
+    for device in devices {
+        let identifier = device.get("identifier").and_then(|i| i.as_str()).unwrap_or("");
+        
+        if identifier == device_id {
+            let connection_props = device.get("connectionProperties");
+            
+            let pairing_state = connection_props
+                .and_then(|c| c.get("pairingState"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            
+            let tunnel_state = connection_props
+                .and_then(|c| c.get("tunnelState"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            
+            if pairing_state != "paired" {
+                return DeviceAvailability::NotPaired;
+            }
+            
+            if tunnel_state == "unavailable" || tunnel_state == "" {
+                return DeviceAvailability::TunnelUnavailable;
+            }
+            
+            return DeviceAvailability::Available;
+        }
+    }
+    
+    DeviceAvailability::NotFound
+}
+
+/// Parse devicectl error output into a user-friendly message
+fn parse_devicectl_error(stderr: &str) -> String {
+    // Common error patterns and their user-friendly messages
+    if stderr.contains("device is not connected") || stderr.contains("no device found") {
+        return "Device is not connected. Check USB cable or WiFi connection.".to_string();
+    }
+    
+    if stderr.contains("tunnel") && stderr.contains("unavailable") {
+        return "Cannot establish connection to device. Try unplugging and reconnecting, or restarting the device.".to_string();
+    }
+    
+    if stderr.contains("timed out") || stderr.contains("timeout") {
+        return "Operation timed out. The device may be busy or unresponsive.".to_string();
+    }
+    
+    if stderr.contains("not paired") || stderr.contains("pairing") {
+        return "Device is not trusted. Connect via USB and tap 'Trust' on the device.".to_string();
+    }
+    
+    if stderr.contains("code signing") || stderr.contains("provisioning") {
+        return "Code signing error. Check your provisioning profile and signing certificate.".to_string();
+    }
+    
+    if stderr.contains("disk space") || stderr.contains("storage") {
+        return "Not enough storage on device. Free up space and try again.".to_string();
+    }
+    
+    if stderr.contains("locked") {
+        return "Device is locked. Unlock the device and try again.".to_string();
+    }
+    
+    // Return first line of error if no specific pattern matched
+    stderr.lines().next().unwrap_or("Unknown error").to_string()
+}
+
+// =============================================================================
 // Device Types
 // =============================================================================
 
@@ -355,6 +476,10 @@ async fn build_project(
 
     let is_workspace = project_file.extension().map_or(false, |ext| ext == "xcworkspace");
 
+    // Check for Tuist project (Project.swift exists)
+    let tuist_manifest = PathBuf::from(&project_dir).join("Project.swift");
+    let is_tuist_project = tuist_manifest.exists();
+
     // Determine scheme (use provided or default to project name)
     let build_scheme = scheme.unwrap_or_else(|| {
         project_file.file_stem()
@@ -382,37 +507,60 @@ async fn build_project(
         }
     };
 
-    // Build xcodebuild command
-    let mut cmd = Command::new("xcodebuild");
-
-    if is_workspace {
-        cmd.arg("-workspace").arg(&project_file);
+    // Build output path - we'll use a consistent path for both Tuist and regular builds
+    let derived_data_path = format!("{}/DerivedData", project_dir);
+    
+    // Build command - use tuist build for Tuist projects (handles generation + caching)
+    let mut cmd;
+    
+    if is_tuist_project {
+        emit_build_event(&app_handle, "output", "Tuist project detected, using tuist build (with caching)...");
+        
+        cmd = Command::new("tuist");
+        cmd.args(["build", "--generate", &build_scheme]);
+        cmd.args(["--build-output-path", &format!("{}/Build/Products", derived_data_path)]);
+        cmd.arg("--");
+        cmd.args(["-destination", &destination]);
+        cmd.args(["-derivedDataPath", &derived_data_path]);
+        
+        // Add -allowProvisioningUpdates for physical devices
+        if is_physical_device {
+            cmd.arg("-allowProvisioningUpdates");
+        }
     } else {
-        cmd.arg("-project").arg(&project_file);
+        // Regular xcodebuild for non-Tuist projects
+        cmd = Command::new("xcodebuild");
+
+        if is_workspace {
+            cmd.arg("-workspace").arg(&project_file);
+        } else {
+            cmd.arg("-project").arg(&project_file);
+        }
+
+        cmd.args([
+            "-scheme", &build_scheme,
+            "-configuration", "Debug",
+            "-destination", &destination,
+            "-derivedDataPath", &format!("{}/DerivedData", project_dir),
+        ]);
+
+        // Add -allowProvisioningUpdates for physical devices (automatic code signing)
+        if is_physical_device {
+            cmd.arg("-allowProvisioningUpdates");
+        }
+
+        cmd.arg("build");
     }
-
-    cmd.args([
-        "-scheme", &build_scheme,
-        "-configuration", "Debug",
-        "-destination", &destination,
-        "-derivedDataPath", &format!("{}/DerivedData", project_dir),
-    ]);
-
-    // Add -allowProvisioningUpdates for physical devices (automatic code signing)
-    if is_physical_device {
-        cmd.arg("-allowProvisioningUpdates");
-    }
-
-    cmd.arg("build");
 
     cmd.current_dir(&project_dir);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    emit_build_event(&app_handle, "output", "Starting xcodebuild...");
-
+    let build_tool = if is_tuist_project { "tuist build" } else { "xcodebuild" };
+    emit_build_event(&app_handle, "output", &format!("Starting {}...", build_tool));
+    
     let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to start xcodebuild: {}", e))?;
+        .map_err(|e| format!("Failed to start {}: {}", build_tool, e))?;
 
     // Stream stdout
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
@@ -573,26 +721,117 @@ async fn run_project(
         // Physical device: use devicectl for install and launch
         // devicectl requires the CoreDevice UUID, not the xcodebuild UDID
         let devicectl_id = core_device_id.ok_or("Device ID required for physical device")?;
+        let device_name = device.as_ref().map(|d| d.name.as_str()).unwrap_or("unknown");
         
-        emit_build_event(&app_handle, "output", &format!("Installing app to physical device {}...", device.as_ref().map(|d| d.name.as_str()).unwrap_or("unknown")));
+        emit_build_event(&app_handle, "output", &format!("Physical device detected: {} (devicectl ID: {})", device_name, devicectl_id));
+        emit_build_event(&app_handle, "output", &format!("App path: {}", app_path));
+        
+        // Check device availability before attempting install
+        emit_build_event(&app_handle, "output", &format!("Checking device {} availability...", device_name));
+        
+        let device_check = check_physical_device_availability(&devicectl_id);
+        match device_check {
+            DeviceAvailability::Available => {
+                emit_build_event(&app_handle, "output", &format!("Device {} is connected and ready", device_name));
+            }
+            DeviceAvailability::TunnelUnavailable => {
+                emit_build_event(&app_handle, "warning", &format!("Device {} tunnel is not ready, attempting to connect...", device_name));
+                // Give devicectl a chance to establish the tunnel
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            DeviceAvailability::NotFound => {
+                emit_build_event(&app_handle, "error", &format!("Device {} not found. Make sure the device is connected via USB or on the same network.", device_name));
+                return Ok(BuildResult {
+                    success: false,
+                    output: format!("Device not found: {}", device_name),
+                    errors: vec![BuildError {
+                        file: None,
+                        line: None,
+                        column: None,
+                        message: format!("Device '{}' not found. Ensure it is connected via USB or on the same WiFi network and is unlocked.", device_name),
+                    }],
+                    warnings: build_result.warnings,
+                    build_time: build_result.build_time,
+                    app_path: Some(app_path),
+                    bundle_id: Some(bundle_id),
+                });
+            }
+            DeviceAvailability::NotPaired => {
+                emit_build_event(&app_handle, "error", &format!("Device {} is not paired. Trust this computer on the device.", device_name));
+                return Ok(BuildResult {
+                    success: false,
+                    output: format!("Device not paired: {}", device_name),
+                    errors: vec![BuildError {
+                        file: None,
+                        line: None,
+                        column: None,
+                        message: format!("Device '{}' is not paired. Connect via USB and tap 'Trust' on the device.", device_name),
+                    }],
+                    warnings: build_result.warnings,
+                    build_time: build_result.build_time,
+                    app_path: Some(app_path),
+                    bundle_id: Some(bundle_id),
+                });
+            }
+        }
+        
+        emit_build_event(&app_handle, "output", &format!("Installing app to physical device {}...", device_name));
 
-        // Install using devicectl
-        let install_output = Command::new("xcrun")
-            .args(["devicectl", "device", "install", "app", "--device", &devicectl_id, &app_path])
-            .output()
-            .map_err(|e| format!("Failed to install app: {}", e))?;
+        // Install using devicectl with timeout and retry logic
+        let max_retries = 2;
+        let mut install_success = false;
+        let mut last_error = String::new();
+        
+        for attempt in 1..=max_retries {
+            if attempt > 1 {
+                emit_build_event(&app_handle, "output", &format!("Retrying install (attempt {}/{})...", attempt, max_retries));
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            
+            emit_build_event(&app_handle, "output", &format!("Running: xcrun devicectl device install app --device {} {}", &devicectl_id, &app_path));
+            
+            let install_output = Command::new("xcrun")
+                .args(["devicectl", "device", "install", "app", "--device", &devicectl_id, &app_path, "--timeout", "120"])
+                .output()
+                .map_err(|e| format!("Failed to run devicectl install: {}", e))?;
 
-        if !install_output.status.success() {
+            let stdout = String::from_utf8_lossy(&install_output.stdout);
             let stderr = String::from_utf8_lossy(&install_output.stderr);
-            emit_build_event(&app_handle, "error", &format!("Install failed: {}", stderr));
+            
+            if !stdout.is_empty() {
+                emit_build_event(&app_handle, "output", &format!("Install stdout: {}", stdout.lines().take(5).collect::<Vec<_>>().join(" | ")));
+            }
+
+            if install_output.status.success() {
+                emit_build_event(&app_handle, "output", "Install succeeded!");
+                install_success = true;
+                break;
+            } else {
+                last_error = stderr.to_string();
+                emit_build_event(&app_handle, "warning", &format!("Install stderr: {}", stderr.lines().take(3).collect::<Vec<_>>().join(" | ")));
+                
+                // Check for specific retryable errors
+                if stderr.contains("tunnel") || stderr.contains("connection") || stderr.contains("timed out") {
+                    emit_build_event(&app_handle, "warning", &format!("Install attempt {} failed (connection issue): {}", attempt, stderr.lines().next().unwrap_or(&stderr)));
+                    continue;
+                } else {
+                    // Non-retryable error, break immediately
+                    break;
+                }
+            }
+        }
+
+        if !install_success {
+            let error_summary = parse_devicectl_error(&last_error);
+            emit_build_event(&app_handle, "error", &format!("Install failed: {}", error_summary));
             return Ok(BuildResult {
                 success: false,
-                output: format!("Install failed: {}", stderr),
+                output: format!("Install failed: {}", error_summary),
                 errors: vec![BuildError {
                     file: None,
                     line: None,
                     column: None,
-                    message: stderr.to_string(),
+                    message: format!("Failed to install app on {}: {}", device_name, error_summary),
                 }],
                 warnings: build_result.warnings,
                 build_time: build_result.build_time,
@@ -602,24 +841,33 @@ async fn run_project(
         }
 
         emit_build_event(&app_handle, "output", "Launching app on physical device...");
+        emit_build_event(&app_handle, "output", &format!("Running: xcrun devicectl device process launch --device {} {}", &devicectl_id, &bundle_id));
 
-        // Launch using devicectl
+        // Launch using devicectl with timeout
         let launch_output = Command::new("xcrun")
-            .args(["devicectl", "device", "process", "launch", "--device", &devicectl_id, &bundle_id])
+            .args(["devicectl", "device", "process", "launch", "--device", &devicectl_id, &bundle_id, "--timeout", "60"])
             .output()
-            .map_err(|e| format!("Failed to launch app: {}", e))?;
+            .map_err(|e| format!("Failed to run devicectl launch: {}", e))?;
+
+        let launch_stdout = String::from_utf8_lossy(&launch_output.stdout);
+        let launch_stderr = String::from_utf8_lossy(&launch_output.stderr);
+        
+        if !launch_stdout.is_empty() {
+            emit_build_event(&app_handle, "output", &format!("Launch stdout: {}", launch_stdout.lines().take(3).collect::<Vec<_>>().join(" | ")));
+        }
 
         if !launch_output.status.success() {
-            let stderr = String::from_utf8_lossy(&launch_output.stderr);
-            emit_build_event(&app_handle, "error", &format!("Launch failed: {}", stderr));
+            let stderr = launch_stderr;
+            let error_summary = parse_devicectl_error(&stderr);
+            emit_build_event(&app_handle, "error", &format!("Launch failed: {}", error_summary));
             return Ok(BuildResult {
                 success: false,
-                output: format!("Launch failed: {}", stderr),
+                output: format!("Launch failed: {}", error_summary),
                 errors: vec![BuildError {
                     file: None,
                     line: None,
                     column: None,
-                    message: stderr.to_string(),
+                    message: format!("Failed to launch app on {}: {}", device_name, error_summary),
                 }],
                 warnings: build_result.warnings,
                 build_time: build_result.build_time,
@@ -687,15 +935,15 @@ async fn run_project(
                 }
             }
 
-            // Open the Simulator app
-            let _ = Command::new("open")
-                .args(["-a", "Simulator"])
-                .output();
-
             // Wait a moment for simulator to boot
             emit_build_event(&app_handle, "output", "Waiting for simulator to boot...");
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
+        
+        // Always ensure Simulator app is open and visible (even if already booted)
+        let _ = Command::new("open")
+            .args(["-a", "Simulator"])
+            .output();
 
         emit_build_event(&app_handle, "output", "Installing app to simulator...");
 

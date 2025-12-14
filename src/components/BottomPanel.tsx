@@ -381,15 +381,31 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
 
         <div className="flex items-center gap-1">
           {activeTab === "output" && buildLogs.length > 0 && (
-            <button
-              onClick={onClearBuildLogs}
-              className="p-1 rounded hover:bg-hover text-text-tertiary hover:text-text-secondary transition-colors"
-              title="Clear output"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeWidth="2" strokeLinecap="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-              </svg>
-            </button>
+            <>
+              <button
+                onClick={() => {
+                  const text = buildLogs.map(log => 
+                    `${log.timestamp.toLocaleTimeString("en-US", { hour12: false })} ${log.message}`
+                  ).join("\n");
+                  navigator.clipboard.writeText(text);
+                }}
+                className="p-1 rounded hover:bg-hover text-text-tertiary hover:text-text-secondary transition-colors"
+                title="Copy all logs"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+              </button>
+              <button
+                onClick={onClearBuildLogs}
+                className="p-1 rounded hover:bg-hover text-text-tertiary hover:text-text-secondary transition-colors"
+                title="Clear output"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeWidth="2" strokeLinecap="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </button>
+            </>
           )}
           {activeTab === "console" && (
             <>
@@ -398,6 +414,22 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
                   {currentApp.deviceName}
                 </span>
               )}
+              <button
+                onClick={() => {
+                  const text = consoleLogs
+                    .filter(log => !consoleFilter || log.message.toLowerCase().includes(consoleFilter.toLowerCase()))
+                    .map(log => 
+                      `${new Date(log.timestamp).toLocaleTimeString("en-US", { hour12: false })} [${log.process}] ${log.message}`
+                    ).join("\n");
+                  navigator.clipboard.writeText(text);
+                }}
+                className="p-1 rounded hover:bg-hover text-text-tertiary hover:text-text-secondary transition-colors"
+                title="Copy all logs"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+              </button>
               <input
                 type="text"
                 placeholder="Filter..."

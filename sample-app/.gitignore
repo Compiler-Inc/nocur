@@ -1,0 +1,7 @@
+
+# Tuist generated
+*.xcodeproj
+*.xcworkspace
+Derived/
+DerivedData/
+.tuist-derived/
