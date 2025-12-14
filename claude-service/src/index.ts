@@ -871,11 +871,12 @@ function toolResponse(result: NocurResult, processor?: (output: string) => strin
 }
 
 // Map model short names to full model IDs
+// Using latest Claude 4.5 models as of Dec 2024
 function resolveModel(model: string): string {
   const modelMap: Record<string, string> = {
-    'sonnet': 'claude-sonnet-4-20250514',
-    'opus': 'claude-opus-4-20250514',
-    'haiku': 'claude-3-5-haiku-20241022',
+    'sonnet': 'claude-sonnet-4-5-20250929',
+    'opus': 'claude-opus-4-5-20251101',
+    'haiku': 'claude-haiku-4-5-20251001',
   };
   return modelMap[model.toLowerCase()] || model;
 }
