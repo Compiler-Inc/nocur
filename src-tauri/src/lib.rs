@@ -773,6 +773,61 @@ async fn run_project(
     })
 }
 
+/// Terminate an app running on a simulator
+#[tauri::command]
+async fn terminate_app_on_simulator(bundle_id: String) -> Result<(), String> {
+    let output = Command::new("xcrun")
+        .args(["simctl", "terminate", "booted", &bundle_id])
+        .output()
+        .map_err(|e| format!("Failed to terminate app: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Don't fail if app wasn't running
+        if !stderr.contains("not found") {
+            return Err(format!("Failed to terminate app: {}", stderr));
+        }
+    }
+
+    Ok(())
+}
+
+/// Terminate an app running on a physical device
+#[tauri::command]
+async fn terminate_app_on_device(device_id: String, bundle_id: String) -> Result<(), String> {
+    // First, try to find the process ID
+    let list_output = Command::new("xcrun")
+        .args(["devicectl", "device", "info", "processes", "--device", &device_id, "--json-output", "/dev/stdout"])
+        .output()
+        .map_err(|e| format!("Failed to list processes: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    
+    // Try to find the PID for our app
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        if let Some(result) = json.get("result") {
+            if let Some(processes) = result.get("runningProcesses").and_then(|p| p.as_array()) {
+                for process in processes {
+                    if let Some(executable) = process.get("executable").and_then(|e| e.as_str()) {
+                        if executable.contains(&bundle_id) || executable.ends_with(&format!("/{}.app", bundle_id.split('.').last().unwrap_or(""))) {
+                            if let Some(pid) = process.get("processIdentifier").and_then(|p| p.as_i64()) {
+                                // Terminate by PID
+                                let _ = Command::new("xcrun")
+                                    .args(["devicectl", "device", "process", "terminate", "--device", &device_id, "--pid", &pid.to_string()])
+                                    .output();
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If we couldn't find/terminate by PID, that's okay - the app might have already stopped
+    Ok(())
+}
+
 use std::fs;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
@@ -3307,6 +3362,8 @@ pub fn run() {
             open_claude_login,
             build_project,
             run_project,
+            terminate_app_on_simulator,
+            terminate_app_on_device,
             list_devices,
             get_selected_device,
             set_selected_device,

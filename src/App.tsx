@@ -157,6 +157,15 @@ const App = () => {
   const [buildStatus, setBuildStatus] = useState<BuildStatus>("idle");
   const [buildTime, setBuildTime] = useState<number | null>(null);
 
+  // App running state
+  const [isAppRunning, setIsAppRunning] = useState(false);
+  const [runningAppInfo, setRunningAppInfo] = useState<{
+    bundleId: string;
+    deviceName: string;
+    deviceId: string;
+    deviceType: "simulator" | "physical";
+  } | null>(null);
+
   // Context review modal state
   const [showContextModal, setShowContextModal] = useState(false);
   const [pendingRecording, setPendingRecording] = useState<RecordingData | null>(null);
@@ -255,6 +264,37 @@ const App = () => {
     setup();
     return () => {
       if (unlisten) unlisten();
+    };
+  }, []);
+
+  // Listen for app launched event to track running state
+  useEffect(() => {
+    let unlistenLaunched: UnlistenFn | undefined;
+    let unlistenStopped: UnlistenFn | undefined;
+
+    const setup = async () => {
+      // Listen for app launch
+      unlistenLaunched = await listen<{
+        bundleId: string;
+        deviceId: string;
+        deviceType: "simulator" | "physical";
+        deviceName: string;
+      }>("app-launched", (event) => {
+        setIsAppRunning(true);
+        setRunningAppInfo(event.payload);
+      });
+
+      // Listen for log streaming stopped (app terminated)
+      unlistenStopped = await listen("device-log-stopped", () => {
+        setIsAppRunning(false);
+        setRunningAppInfo(null);
+      });
+    };
+
+    setup();
+    return () => {
+      if (unlistenLaunched) unlistenLaunched();
+      if (unlistenStopped) unlistenStopped();
     };
   }, []);
 
@@ -392,6 +432,34 @@ const App = () => {
     } catch (error) {
       console.error("Run failed:", error);
       setBuildStatus("failed");
+    }
+  };
+
+  const handleStopApp = async () => {
+    if (!runningAppInfo) return;
+
+    try {
+      if (runningAppInfo.deviceType === "physical") {
+        // Stop physical device logs (this also terminates via --console ending)
+        await invoke("stop_physical_device_logs");
+        // Terminate the app on device
+        await invoke("terminate_app_on_device", {
+          deviceId: runningAppInfo.deviceId,
+          bundleId: runningAppInfo.bundleId,
+        });
+      } else {
+        // Stop simulator logs
+        await invoke("stop_simulator_logs");
+        // Terminate the app on simulator
+        await invoke("terminate_app_on_simulator", {
+          bundleId: runningAppInfo.bundleId,
+        });
+      }
+    } catch (err) {
+      console.error("Failed to stop app:", err);
+    } finally {
+      setIsAppRunning(false);
+      setRunningAppInfo(null);
     }
   };
 
@@ -544,30 +612,53 @@ const App = () => {
 
         {/* Right: Build controls and settings */}
         <div className="flex items-center gap-3">
-          {/* Build controls */}
+          {/* Build/Run status */}
           <div className="flex items-center gap-2">
-            <div className={`h-2 w-2 rounded-full ${statusConfig[buildStatus].color}`} />
-            <span className="text-xs text-text-secondary">{statusConfig[buildStatus].text}</span>
+            {isAppRunning ? (
+              <>
+                <div className="h-2 w-2 rounded-full bg-success animate-pulse" />
+                <span className="text-xs text-success">
+                  Running on {runningAppInfo?.deviceName || "device"}
+                </span>
+              </>
+            ) : (
+              <>
+                <div className={`h-2 w-2 rounded-full ${statusConfig[buildStatus].color}`} />
+                <span className="text-xs text-text-secondary">{statusConfig[buildStatus].text}</span>
+              </>
+            )}
           </div>
           <DeviceSelector
             selectedDevice={selectedDevice}
             onDeviceSelect={setSelectedDevice}
-            disabled={buildStatus === "building"}
+            disabled={buildStatus === "building" || isAppRunning}
           />
           <button
             onClick={handleBuild}
-            disabled={buildStatus === "building"}
+            disabled={buildStatus === "building" || isAppRunning}
             className="px-2.5 py-1 text-xs rounded bg-surface-overlay hover:bg-hover text-text-primary transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Build
           </button>
-          <button
-            onClick={handleRun}
-            disabled={buildStatus === "building"}
-            className="px-2.5 py-1 text-xs rounded bg-accent hover:bg-accent-muted text-surface-base transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-medium"
-          >
-            ▶ Run
-          </button>
+          {isAppRunning ? (
+            <button
+              onClick={handleStopApp}
+              className="px-2.5 py-1 text-xs rounded bg-error hover:bg-error/80 text-white transition-colors font-medium flex items-center gap-1.5"
+            >
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+              Stop
+            </button>
+          ) : (
+            <button
+              onClick={handleRun}
+              disabled={buildStatus === "building"}
+              className="px-2.5 py-1 text-xs rounded bg-accent hover:bg-accent-muted text-surface-base transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+            >
+              ▶ Run
+            </button>
+          )}
           <div className="h-4 w-px bg-border ml-1" />
           {/* ACE Playbook button */}
           <button
