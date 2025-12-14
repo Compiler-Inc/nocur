@@ -10,7 +10,9 @@ use parking_lot::Mutex;
 
 mod ace;
 mod claude;
+mod menu;
 mod permissions;
+mod project;
 #[cfg(target_os = "macos")]
 mod window_capture;
 
@@ -3578,6 +3580,47 @@ fn ace_list_playbooks() -> Result<Vec<String>, String> {
     ace::list_playbooks()
 }
 
+// =============================================================================
+// Project Management Commands
+// =============================================================================
+
+#[tauri::command]
+fn create_project(request: project::CreateProjectRequest) -> Result<project::ProjectInfo, String> {
+    project::create_project(&request)
+}
+
+#[tauri::command]
+fn get_recent_projects() -> Vec<project::ProjectInfo> {
+    project::load_recent_projects()
+}
+
+#[tauri::command]
+fn add_to_recent_projects(path: String, app_handle: tauri::AppHandle) -> Result<Vec<project::ProjectInfo>, String> {
+    let result = project::add_recent_project(&path)?;
+    // Update menu to reflect new recent project
+    menu::update_recent_menu(&app_handle);
+    Ok(result)
+}
+
+#[tauri::command]
+fn remove_from_recent_projects(path: String, app_handle: tauri::AppHandle) -> Result<Vec<project::ProjectInfo>, String> {
+    let result = project::remove_recent_project(&path)?;
+    menu::update_recent_menu(&app_handle);
+    Ok(result)
+}
+
+#[tauri::command]
+fn clear_all_recent_projects(app_handle: tauri::AppHandle) -> Result<(), String> {
+    project::clear_recent_projects()?;
+    menu::update_recent_menu(&app_handle);
+    Ok(())
+}
+
+#[tauri::command]
+fn validate_project_path(path: String) -> Result<project::ProjectValidation, String> {
+    project::validate_project(&path)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "macos")]
@@ -3591,6 +3634,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_pty::init())
         .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(ClaudeState::new()))
         .manage(Mutex::new(PermissionState::new()))
         .manage(Mutex::new(AppState::default()));
@@ -3617,7 +3661,19 @@ pub fn run() {
             let permission_state = app.state::<Mutex<PermissionState>>();
             permission_state.lock().server.start(app.handle().clone());
 
+            // Set up application menu (macOS)
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                if let Ok(app_menu) = menu::create_menu(&handle) {
+                    let _ = app.set_menu(app_menu);
+                }
+            }
+
             Ok(())
+        })
+        .on_menu_event(|app, event| {
+            menu::handle_menu_event(app, event.id().as_ref());
         })
         .invoke_handler(tauri::generate_handler![
             check_claude_code_status,
@@ -3686,6 +3742,13 @@ pub fn run() {
             ace_get_reflections,
             ace_save_reflection,
             ace_list_playbooks,
+            // Project management
+            create_project,
+            get_recent_projects,
+            add_to_recent_projects,
+            remove_from_recent_projects,
+            clear_all_recent_projects,
+            validate_project_path,
             // Window capture (macOS only)
             #[cfg(target_os = "macos")]
             start_simulator_stream,

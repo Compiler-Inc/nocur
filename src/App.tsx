@@ -12,6 +12,9 @@ import { ContextReviewModal, RecordingData } from "@/components/ContextReviewMod
 import { BottomPanel, BottomPanelHandle } from "@/components/BottomPanel";
 import { PlaybookModal } from "@/components/PlaybookModal";
 import { DeviceSelector } from "@/components/DeviceSelector";
+import { ProjectProvider, useProject } from "@/lib/project-context";
+import { WelcomeScreen } from "@/components/WelcomeScreen";
+import { NewProjectModal } from "@/components/NewProjectModal";
 
 // DEBUG: Set to true to always show onboarding
 const DEBUG_SHOW_ONBOARDING = false;
@@ -82,9 +85,10 @@ interface GitInfo {
   workingDir: string;
 }
 
-const PROJECT_PATH = "<REPO_ROOT>/sample-app";
-const PROJECT_SCHEME = "NocurTestApp";
-const ROOT_PROJECT_PATH = "<REPO_ROOT>";
+// Default paths used when no project is selected via context
+// These are fallbacks for backwards compatibility
+const DEFAULT_PROJECT_PATH = "<REPO_ROOT>/sample-app";
+const DEFAULT_PROJECT_SCHEME = "NocurTestApp";
 
 // Resizable divider component
 const ResizeHandle = ({
@@ -137,7 +141,15 @@ const ResizeHandle = ({
   );
 };
 
-const App = () => {
+// Internal app content component that uses project context
+const AppContent = () => {
+  const { currentProject, showNewProjectModal, setShowNewProjectModal } = useProject();
+  
+  // Derived project paths from context
+  const PROJECT_PATH = currentProject?.path || DEFAULT_PROJECT_PATH;
+  const PROJECT_SCHEME = currentProject?.name || DEFAULT_PROJECT_SCHEME;
+  const ROOT_PROJECT_PATH = PROJECT_PATH; // For now, project root is the project path
+
   const [isReady, setIsReady] = useState<boolean | null>(DEBUG_SHOW_ONBOARDING ? false : null);
   const [showOnboarding, setShowOnboarding] = useState(true);
 
@@ -790,8 +802,48 @@ const App = () => {
         onClose={() => setShowPlaybookModal(false)}
         projectPath={ROOT_PROJECT_PATH}
       />
+
+      {/* New Project Modal */}
+      <NewProjectModal
+        isOpen={showNewProjectModal}
+        onClose={() => setShowNewProjectModal(false)}
+      />
     </div>
   );
+};
+
+// Main App component with ProjectProvider wrapper
+const App = () => {
+  return (
+    <ProjectProvider>
+      <AppWithProject />
+    </ProjectProvider>
+  );
+};
+
+// App component that uses project context to decide what to show
+const AppWithProject = () => {
+  const { currentProject, isLoading } = useProject();
+
+  // Show loading while context initializes
+  if (isLoading) {
+    return (
+      <div className="h-screen w-screen bg-surface-base flex items-center justify-center">
+        <div className="text-center">
+          <div className="text-4xl mb-4 text-accent">◎</div>
+          <p className="text-sm text-text-secondary">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Show welcome screen if no project is selected
+  if (!currentProject) {
+    return <WelcomeScreen />;
+  }
+
+  // Show main app content with project
+  return <AppContent />;
 };
 
 export default App;

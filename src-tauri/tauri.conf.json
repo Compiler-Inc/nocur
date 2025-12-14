@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "nocur",
+  "productName": "Nocur",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.nocur.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Nocur",
         "width": 1400,
         "height": 850,
@@ -27,7 +28,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$TEMP/**", "/var/folders/**", "/tmp/**"]
+        "scope": ["$TEMP/**", "/var/folders/**", "/tmp/**", "$HOME/**"]
       }
     }
   },
@@ -41,5 +42,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
-  }
+  },
+  "plugins": {}
 }
