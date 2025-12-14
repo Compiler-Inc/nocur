@@ -28,6 +28,13 @@ interface AppLaunchedEvent {
   deviceName: string;
 }
 
+interface CurrentAppInfo {
+  bundleId: string;
+  deviceName: string;
+  deviceId: string | null;
+  deviceType: "simulator" | "physical";
+}
+
 interface BottomPanelProps {
   height: number;
   onHeightChange: (height: number) => void;
@@ -59,7 +66,7 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
   const [activeTerminalId, setActiveTerminalId] = useState<string>(terminals[0].id);
   const [consoleLogs, setConsoleLogs] = useState<ConsoleLogEntry[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [currentApp, setCurrentApp] = useState<{ bundleId: string; deviceName: string } | null>(null);
+  const [currentApp, setCurrentApp] = useState<CurrentAppInfo | null>(null);
   const [consoleFilter, setConsoleFilter] = useState<string>("");
   const buildEndRef = useRef<HTMLDivElement>(null);
   const consoleEndRef = useRef<HTMLDivElement>(null);
@@ -96,20 +103,25 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
     const setup = async () => {
       // Listen for app launch
       unlisten = await listen<AppLaunchedEvent>("app-launched", async (event) => {
-        const { bundleId, deviceType, deviceName } = event.payload;
+        const { bundleId, deviceId, deviceType, deviceName } = event.payload;
         
-        setCurrentApp({ bundleId, deviceName });
+        setCurrentApp({ bundleId, deviceName, deviceId, deviceType });
         setConsoleLogs([]);
         setActiveTab("console");
         setIsStreaming(true);
 
-        // Only start log streaming for simulators (physical device logs not yet implemented)
-        if (deviceType === "simulator") {
-          try {
+        // Start log streaming based on device type
+        try {
+          if (deviceType === "simulator") {
             await invoke("start_simulator_logs", { bundleId });
-          } catch (err) {
-            console.error("Failed to start log streaming:", err);
+          } else if (deviceType === "physical" && deviceId) {
+            // For physical devices, use devicectl with --console
+            // This will re-launch the app with console attached
+            await invoke("start_physical_device_logs", { deviceId, bundleId });
           }
+        } catch (err) {
+          console.error("Failed to start log streaming:", err);
+          setIsStreaming(false);
         }
       });
 
@@ -133,18 +145,23 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
       if (logUnlisten) logUnlisten();
       // Stop streaming when component unmounts
       invoke("stop_simulator_logs").catch(() => {});
+      invoke("stop_physical_device_logs").catch(() => {});
     };
   }, []);
 
   // Stop log streaming when panel closes or switches away
   const handleStopLogs = useCallback(async () => {
     try {
-      await invoke("stop_simulator_logs");
+      if (currentApp?.deviceType === "physical") {
+        await invoke("stop_physical_device_logs");
+      } else {
+        await invoke("stop_simulator_logs");
+      }
       setIsStreaming(false);
     } catch (err) {
       console.error("Failed to stop logs:", err);
     }
-  }, []);
+  }, [currentApp?.deviceType]);
 
   const handleClearConsoleLogs = useCallback(() => {
     setConsoleLogs([]);
@@ -404,7 +421,14 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
                     if (currentApp) {
                       setIsStreaming(true);
                       try {
-                        await invoke("start_simulator_logs", { bundleId: currentApp.bundleId });
+                        if (currentApp.deviceType === "physical" && currentApp.deviceId) {
+                          await invoke("start_physical_device_logs", { 
+                            deviceId: currentApp.deviceId, 
+                            bundleId: currentApp.bundleId 
+                          });
+                        } else {
+                          await invoke("start_simulator_logs", { bundleId: currentApp.bundleId });
+                        }
                       } catch (err) {
                         console.error("Failed to start logs:", err);
                         setIsStreaming(false);

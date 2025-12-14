@@ -2642,6 +2642,206 @@ async fn clear_simulator_logs(
     Ok(())
 }
 
+// ============ Physical Device Log Streaming ============
+
+/// State for physical device log streaming
+pub struct PhysicalDeviceLogState {
+    is_streaming: AtomicBool,
+    child_pid: RwLock<Option<u32>>,
+}
+
+impl PhysicalDeviceLogState {
+    pub fn new() -> Self {
+        Self {
+            is_streaming: AtomicBool::new(false),
+            child_pid: RwLock::new(None),
+        }
+    }
+}
+
+/// Start streaming logs from a physical device app
+/// This uses `xcrun devicectl device process launch --console` to stream stdout/stderr
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn start_physical_device_logs(
+    device_id: String,
+    bundle_id: String,
+    app_handle: tauri::AppHandle,
+    state: State<'_, Arc<PhysicalDeviceLogState>>,
+) -> Result<(), String> {
+    if state.is_streaming.load(Ordering::SeqCst) {
+        return Ok(()); // Already streaming
+    }
+
+    state.is_streaming.store(true, Ordering::SeqCst);
+
+    let state_clone = state.inner().clone();
+    let app_handle_clone = app_handle.clone();
+
+    // Spawn log streaming in background
+    std::thread::spawn(move || {
+        // Use devicectl to launch with console attached
+        // This streams the app's stdout/stderr
+        let mut cmd = Command::new("xcrun");
+        cmd.args([
+            "devicectl", "device", "process", "launch",
+            "--device", &device_id,
+            "--console",
+            "--terminate-existing",
+            &bundle_id
+        ]);
+
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("Failed to start physical device log stream: {}", e);
+                let _ = app_handle_clone.emit("device-log-error", serde_json::json!({
+                    "error": format!("Failed to start log stream: {}", e)
+                }));
+                state_clone.is_streaming.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        // Store child PID for later killing
+        let pid = child.id();
+        *state_clone.child_pid.write().unwrap() = Some(pid);
+
+        // Emit that we started streaming
+        let _ = app_handle_clone.emit("device-log-started", serde_json::json!({
+            "deviceId": device_id,
+            "bundleId": bundle_id
+        }));
+
+        let stdout = child.stdout.take().expect("Failed to capture stdout");
+        let stderr = child.stderr.take();
+
+        // Read stdout in a thread
+        let app_handle_stdout = app_handle_clone.clone();
+        let state_stdout = state_clone.clone();
+        let stdout_thread = std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+
+            for line in reader.lines() {
+                if !state_stdout.is_streaming.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                if let Ok(line) = line {
+                    // Skip devicectl status messages
+                    if line.starts_with("Launched application") || 
+                       line.starts_with("Process ") ||
+                       line.trim().is_empty() {
+                        continue;
+                    }
+
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    // Determine log level from content
+                    let level = if line.contains("error") || line.contains("Error") || line.contains("ERROR") {
+                        "error"
+                    } else if line.contains("warning") || line.contains("Warning") || line.contains("WARN") {
+                        "warning"
+                    } else if line.contains("debug") || line.contains("Debug") || line.contains("DEBUG") {
+                        "debug"
+                    } else {
+                        "info"
+                    }.to_string();
+
+                    let entry = SimulatorLogEntry {
+                        timestamp,
+                        level,
+                        process: "app".to_string(),
+                        message: line,
+                    };
+
+                    // Emit log entry - reuse the same event type as simulator
+                    let _ = app_handle_stdout.emit("simulator-log", LogStreamEvent {
+                        entries: vec![entry],
+                    });
+                }
+            }
+        });
+
+        // Also read stderr if available
+        if let Some(stderr) = stderr {
+            let app_handle_stderr = app_handle_clone.clone();
+            let state_stderr = state_clone.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+
+                for line in reader.lines() {
+                    if !state_stderr.is_streaming.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    if let Ok(line) = line {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+
+                        let entry = SimulatorLogEntry {
+                            timestamp,
+                            level: "error".to_string(),
+                            process: "app".to_string(),
+                            message: line,
+                        };
+
+                        let _ = app_handle_stderr.emit("simulator-log", LogStreamEvent {
+                            entries: vec![entry],
+                        });
+                    }
+                }
+            });
+        }
+
+        // Wait for stdout thread to finish
+        let _ = stdout_thread.join();
+
+        // Wait for process to exit
+        let exit_status = child.wait();
+        
+        // Emit that streaming stopped
+        let _ = app_handle_clone.emit("device-log-stopped", serde_json::json!({
+            "exitStatus": exit_status.map(|s| s.code()).ok().flatten()
+        }));
+
+        state_clone.is_streaming.store(false, Ordering::SeqCst);
+        *state_clone.child_pid.write().unwrap() = None;
+    });
+
+    Ok(())
+}
+
+/// Stop streaming physical device logs
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn stop_physical_device_logs(
+    state: State<'_, Arc<PhysicalDeviceLogState>>,
+) -> Result<(), String> {
+    state.is_streaming.store(false, Ordering::SeqCst);
+
+    // Kill the child process if running
+    if let Some(pid) = *state.child_pid.read().unwrap() {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
+    }
+
+    Ok(())
+}
+
 // ============ Crash Reports ============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3061,6 +3261,8 @@ pub fn run() {
     let window_capture_state = Arc::new(WindowCaptureState::new());
     #[cfg(target_os = "macos")]
     let log_state = Arc::new(SimulatorLogState::new());
+    #[cfg(target_os = "macos")]
+    let physical_device_log_state = Arc::new(PhysicalDeviceLogState::new());
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -3074,7 +3276,8 @@ pub fn run() {
     {
         builder = builder
             .manage(window_capture_state)
-            .manage(log_state);
+            .manage(log_state)
+            .manage(physical_device_log_state);
     }
 
     builder
@@ -3182,6 +3385,10 @@ pub fn run() {
             get_simulator_logs,
             #[cfg(target_os = "macos")]
             clear_simulator_logs,
+            #[cfg(target_os = "macos")]
+            start_physical_device_logs,
+            #[cfg(target_os = "macos")]
+            stop_physical_device_logs,
             #[cfg(target_os = "macos")]
             get_crash_reports,
             // Screenshot saving
