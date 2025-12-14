@@ -795,35 +795,46 @@ async fn terminate_app_on_simulator(bundle_id: String) -> Result<(), String> {
 /// Terminate an app running on a physical device
 #[tauri::command]
 async fn terminate_app_on_device(device_id: String, bundle_id: String) -> Result<(), String> {
-    // First, try to find the process ID
+    // Get the app name from bundle ID (last component, e.g., "NocurTestApp" from "com.nocur.NocurTestApp")
+    let app_name = bundle_id.split('.').last().unwrap_or(&bundle_id);
+    
+    // List processes and find our app
     let list_output = Command::new("xcrun")
-        .args(["devicectl", "device", "info", "processes", "--device", &device_id, "--json-output", "/dev/stdout"])
+        .args(["devicectl", "device", "info", "processes", "--device", &device_id])
         .output()
         .map_err(|e| format!("Failed to list processes: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&list_output.stdout);
+    let stderr = String::from_utf8_lossy(&list_output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
     
-    // Try to find the PID for our app
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-        if let Some(result) = json.get("result") {
-            if let Some(processes) = result.get("runningProcesses").and_then(|p| p.as_array()) {
-                for process in processes {
-                    if let Some(executable) = process.get("executable").and_then(|e| e.as_str()) {
-                        if executable.contains(&bundle_id) || executable.ends_with(&format!("/{}.app", bundle_id.split('.').last().unwrap_or(""))) {
-                            if let Some(pid) = process.get("processIdentifier").and_then(|p| p.as_i64()) {
-                                // Terminate by PID
-                                let _ = Command::new("xcrun")
-                                    .args(["devicectl", "device", "process", "terminate", "--device", &device_id, "--pid", &pid.to_string()])
-                                    .output();
-                                return Ok(());
-                            }
-                        }
+    // Parse the text output to find PID
+    // Format: "58681   /private/var/containers/Bundle/Application/.../NocurTestApp.app/NocurTestApp"
+    for line in combined.lines() {
+        if line.contains(&format!("{}.app/{}", app_name, app_name)) || line.contains(&format!("/{}.app", app_name)) {
+            // Extract PID from the beginning of the line
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pid_str) = parts.first() {
+                if let Ok(pid) = pid_str.parse::<i64>() {
+                    log::info!("Found app {} with PID {}, terminating...", app_name, pid);
+                    
+                    // Terminate by PID
+                    let term_output = Command::new("xcrun")
+                        .args(["devicectl", "device", "process", "terminate", "--device", &device_id, "--pid", &pid.to_string()])
+                        .output();
+                    
+                    if let Ok(output) = term_output {
+                        let term_stderr = String::from_utf8_lossy(&output.stderr);
+                        log::info!("Terminate result: {}", term_stderr);
                     }
+                    
+                    return Ok(());
                 }
             }
         }
     }
 
+    log::warn!("Could not find running process for {}", bundle_id);
     // If we couldn't find/terminate by PID, that's okay - the app might have already stopped
     Ok(())
 }
@@ -1035,17 +1046,17 @@ async fn get_available_models() -> Result<Vec<ModelInfo>, String> {
     Ok(vec![
         ModelInfo {
             id: "sonnet".to_string(),
-            name: "Claude 4 Sonnet".to_string(),
+            name: "Claude Sonnet 4.5".to_string(),
             description: "Fast and capable, great for most coding tasks".to_string(),
         },
         ModelInfo {
             id: "opus".to_string(),
-            name: "Claude 4.5 Opus".to_string(),
+            name: "Claude Opus 4.5".to_string(),
             description: "Most powerful, best for complex reasoning".to_string(),
         },
         ModelInfo {
             id: "haiku".to_string(),
-            name: "Claude 3.5 Haiku".to_string(),
+            name: "Claude Haiku 4.5".to_string(),
             description: "Fastest and most economical".to_string(),
         },
     ])

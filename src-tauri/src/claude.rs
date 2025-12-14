@@ -154,9 +154,9 @@ impl ClaudeModel {
 
     pub fn display_name(&self) -> &str {
         match self {
-            ClaudeModel::Sonnet => "Claude Sonnet",
-            ClaudeModel::Opus => "Claude Opus",
-            ClaudeModel::Haiku => "Claude Haiku",
+            ClaudeModel::Sonnet => "Claude Sonnet 4.5",
+            ClaudeModel::Opus => "Claude Opus 4.5",
+            ClaudeModel::Haiku => "Claude Haiku 4.5",
         }
     }
 }
