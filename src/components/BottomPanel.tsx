@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { XTerminal, XTerminalHandle } from "./XTerminal";
 
 interface LogEntry {
@@ -7,9 +9,23 @@ interface LogEntry {
   timestamp: Date;
 }
 
+interface ConsoleLogEntry {
+  timestamp: number;
+  level: string;
+  process: string;
+  message: string;
+}
+
 interface TerminalInstance {
   id: string;
   name: string;
+}
+
+interface AppLaunchedEvent {
+  bundleId: string;
+  deviceId: string | null;
+  deviceType: "simulator" | "physical";
+  deviceName: string;
 }
 
 interface BottomPanelProps {
@@ -35,13 +51,18 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
   onClearBuildLogs,
   projectPath,
 }, ref) => {
-  const [activeTab, setActiveTab] = useState<"terminal" | "output">("terminal");
+  const [activeTab, setActiveTab] = useState<"terminal" | "output" | "console">("terminal");
   const [terminals, setTerminals] = useState<TerminalInstance[]>(() => {
     terminalCounter++;
     return [{ id: `term-${terminalCounter}`, name: "zsh" }];
   });
   const [activeTerminalId, setActiveTerminalId] = useState<string>(terminals[0].id);
+  const [consoleLogs, setConsoleLogs] = useState<ConsoleLogEntry[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [currentApp, setCurrentApp] = useState<{ bundleId: string; deviceName: string } | null>(null);
+  const [consoleFilter, setConsoleFilter] = useState<string>("");
   const buildEndRef = useRef<HTMLDivElement>(null);
+  const consoleEndRef = useRef<HTMLDivElement>(null);
   const terminalRefs = useRef<Map<string, XTerminalHandle>>(new Map());
   const resizing = useRef(false);
   const startY = useRef(0);
@@ -52,6 +73,11 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
     buildEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [buildLogs]);
 
+  // Auto-scroll console logs
+  useEffect(() => {
+    consoleEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [consoleLogs]);
+
   // Switch to output tab when new build logs come in
   useEffect(() => {
     if (buildLogs.length > 0) {
@@ -61,6 +87,68 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
       }
     }
   }, [buildLogs]);
+
+  // Listen for app-launched events to start console streaming
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let logUnlisten: UnlistenFn | undefined;
+
+    const setup = async () => {
+      // Listen for app launch
+      unlisten = await listen<AppLaunchedEvent>("app-launched", async (event) => {
+        const { bundleId, deviceType, deviceName } = event.payload;
+        
+        setCurrentApp({ bundleId, deviceName });
+        setConsoleLogs([]);
+        setActiveTab("console");
+        setIsStreaming(true);
+
+        // Only start log streaming for simulators (physical device logs not yet implemented)
+        if (deviceType === "simulator") {
+          try {
+            await invoke("start_simulator_logs", { bundleId });
+          } catch (err) {
+            console.error("Failed to start log streaming:", err);
+          }
+        }
+      });
+
+      // Listen for incoming logs
+      logUnlisten = await listen<{ entries: ConsoleLogEntry[] }>("simulator-log", (event) => {
+        setConsoleLogs((prev) => {
+          const newLogs = [...prev, ...event.payload.entries];
+          // Keep only last 500 entries in memory
+          if (newLogs.length > 500) {
+            return newLogs.slice(-500);
+          }
+          return newLogs;
+        });
+      });
+    };
+
+    setup();
+
+    return () => {
+      if (unlisten) unlisten();
+      if (logUnlisten) logUnlisten();
+      // Stop streaming when component unmounts
+      invoke("stop_simulator_logs").catch(() => {});
+    };
+  }, []);
+
+  // Stop log streaming when panel closes or switches away
+  const handleStopLogs = useCallback(async () => {
+    try {
+      await invoke("stop_simulator_logs");
+      setIsStreaming(false);
+    } catch (err) {
+      console.error("Failed to stop logs:", err);
+    }
+  }, []);
+
+  const handleClearConsoleLogs = useCallback(() => {
+    setConsoleLogs([]);
+  }, []);
 
   // Resize handlers
   useEffect(() => {
@@ -206,6 +294,26 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
                 </span>
               )}
             </button>
+            <button
+              onClick={() => setActiveTab("console")}
+              className={`px-3 py-1.5 text-xs font-medium transition-colors border-b-2 -mb-[1px] flex items-center gap-1.5 ${
+                activeTab === "console"
+                  ? "text-text-primary border-accent"
+                  : "text-text-tertiary hover:text-text-secondary border-transparent"
+              }`}
+            >
+              Console
+              {isStreaming && (
+                <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" title="Streaming" />
+              )}
+              {consoleLogs.length > 0 && (
+                <span className={`px-1.5 py-0.5 text-[10px] rounded ${
+                  activeTab === "console" ? "bg-accent/20 text-accent" : "bg-surface-sunken text-text-tertiary"
+                }`}>
+                  {consoleLogs.length}
+                </span>
+              )}
+            </button>
           </div>
 
           {/* Terminal instance tabs */}
@@ -266,6 +374,63 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
               </svg>
             </button>
           )}
+          {activeTab === "console" && (
+            <>
+              {currentApp && (
+                <span className="text-[10px] text-text-tertiary px-2 truncate max-w-[150px]">
+                  {currentApp.deviceName}
+                </span>
+              )}
+              <input
+                type="text"
+                placeholder="Filter..."
+                value={consoleFilter}
+                onChange={(e) => setConsoleFilter(e.target.value)}
+                className="w-24 px-2 py-0.5 text-[11px] bg-surface-sunken border border-border rounded text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
+              />
+              {isStreaming ? (
+                <button
+                  onClick={handleStopLogs}
+                  className="p-1 rounded hover:bg-hover text-warning hover:text-warning transition-colors"
+                  title="Stop streaming"
+                >
+                  <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
+                    <rect x="6" y="6" width="12" height="12" rx="2" />
+                  </svg>
+                </button>
+              ) : (
+                <button
+                  onClick={async () => {
+                    if (currentApp) {
+                      setIsStreaming(true);
+                      try {
+                        await invoke("start_simulator_logs", { bundleId: currentApp.bundleId });
+                      } catch (err) {
+                        console.error("Failed to start logs:", err);
+                        setIsStreaming(false);
+                      }
+                    }
+                  }}
+                  disabled={!currentApp}
+                  className="p-1 rounded hover:bg-hover text-text-tertiary hover:text-success transition-colors disabled:opacity-50"
+                  title="Start streaming"
+                >
+                  <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M8 5v14l11-7z" />
+                  </svg>
+                </button>
+              )}
+              <button
+                onClick={handleClearConsoleLogs}
+                className="p-1 rounded hover:bg-hover text-text-tertiary hover:text-text-secondary transition-colors"
+                title="Clear console"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeWidth="2" strokeLinecap="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </button>
+            </>
+          )}
           {activeTab === "terminal" && (
             <button
               onClick={addTerminal}
@@ -309,7 +474,7 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
               </div>
             ))}
           </>
-        ) : (
+        ) : activeTab === "output" ? (
           <div className="h-full overflow-auto p-2 font-mono text-[12px] bg-surface-sunken">
             {buildLogs.length === 0 ? (
               <div className="text-text-tertiary">
@@ -327,6 +492,41 @@ export const BottomPanel = forwardRef<BottomPanelHandle, BottomPanelProps>(({
               ))
             )}
             <div ref={buildEndRef} />
+          </div>
+        ) : (
+          /* Console tab */
+          <div className="h-full overflow-auto p-2 font-mono text-[11px] bg-surface-sunken">
+            {consoleLogs.length === 0 ? (
+              <div className="text-text-tertiary">
+                {currentApp 
+                  ? `Waiting for logs from ${currentApp.bundleId}...`
+                  : "Run your app to see console output here."
+                }
+              </div>
+            ) : (
+              consoleLogs
+                .filter(log => !consoleFilter || log.message.toLowerCase().includes(consoleFilter.toLowerCase()))
+                .map((log, i) => (
+                  <div 
+                    key={i} 
+                    className={`leading-relaxed whitespace-pre-wrap ${
+                      log.level === "error" || log.level === "fault" ? "text-error" :
+                      log.level === "warning" ? "text-warning" :
+                      log.level === "debug" ? "text-text-tertiary" :
+                      "text-text-secondary"
+                    }`}
+                  >
+                    <span className="text-text-tertiary opacity-50 select-none text-[10px]">
+                      {new Date(log.timestamp).toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                    </span>
+                    {" "}
+                    <span className="text-accent opacity-70">[{log.process}]</span>
+                    {" "}
+                    {log.message}
+                  </div>
+                ))
+            )}
+            <div ref={consoleEndRef} />
           </div>
         )}
       </div>

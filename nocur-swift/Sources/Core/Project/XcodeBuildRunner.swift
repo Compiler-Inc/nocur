@@ -1,17 +1,20 @@
 import Foundation
 
+// DeviceInfo is defined in Core/Device/DeviceManager.swift
+
 /// Wraps xcodebuild for building iOS apps
 public final class XcodeBuildRunner {
 
     public init() {}
 
-    // MARK: - Build
+    // MARK: - Build with Device Info
 
+    /// Build for a specific device (simulator or physical)
     public func build(
         projectPath: String?,
         scheme: String?,
         configuration: String,
-        destinationUDID: String?,
+        device: DeviceInfo?,
         clean: Bool
     ) async throws -> BuildResult {
         let detector = ProjectDetector()
@@ -29,12 +32,23 @@ public final class XcodeBuildRunner {
             throw NocurError.invalidArgument("No scheme found. Please specify --scheme")
         }
 
-        // Build destination
+        // Build destination based on device type
         let destination: String
-        if let udid = destinationUDID {
-            destination = "platform=iOS Simulator,id=\(udid)"
+        let isPhysicalDevice: Bool
+        
+        if let device = device {
+            switch device.deviceType {
+            case .simulator:
+                destination = "platform=iOS Simulator,id=\(device.id)"
+                isPhysicalDevice = false
+            case .physical:
+                destination = "platform=iOS,id=\(device.id)"
+                isPhysicalDevice = true
+            }
         } else {
+            // Default to simulator
             destination = "platform=iOS Simulator,name=iPhone 16 Pro"
+            isPhysicalDevice = false
         }
 
         // Construct xcodebuild command
@@ -52,6 +66,11 @@ public final class XcodeBuildRunner {
             "-destination", destination,
             "-derivedDataPath", "DerivedData"
         ])
+        
+        // For physical devices, allow automatic provisioning updates
+        if isPhysicalDevice {
+            args.append("-allowProvisioningUpdates")
+        }
 
         if clean {
             args.append("clean")
@@ -73,11 +92,12 @@ public final class XcodeBuildRunner {
             throw NocurError.buildFailed(errors: buildErrors)
         }
 
-        // Find built app
+        // Find built app (different path for device vs simulator)
         let appPath = try findBuiltApp(
             derivedDataPath: "DerivedData",
             scheme: buildScheme,
-            configuration: configuration
+            configuration: configuration,
+            isPhysicalDevice: isPhysicalDevice
         )
 
         // Get bundle ID
@@ -89,6 +109,39 @@ public final class XcodeBuildRunner {
             buildTime: buildTime,
             warnings: warnings,
             errors: buildErrors.count
+        )
+    }
+    
+    // MARK: - Legacy Build (for backward compatibility)
+
+    public func build(
+        projectPath: String?,
+        scheme: String?,
+        configuration: String,
+        destinationUDID: String?,
+        clean: Bool
+    ) async throws -> BuildResult {
+        // Convert UDID to DeviceInfo if provided
+        var device: DeviceInfo? = nil
+        if let udid = destinationUDID {
+            // Assume simulator for legacy calls
+            device = DeviceInfo(
+                id: udid,
+                name: "Simulator",
+                model: "Simulator",
+                osVersion: "Unknown",
+                deviceType: .simulator,
+                state: .booted,
+                isAvailable: true
+            )
+        }
+        
+        return try await build(
+            projectPath: projectPath,
+            scheme: scheme,
+            configuration: configuration,
+            device: device,
+            clean: clean
         )
     }
 
@@ -165,8 +218,15 @@ public final class XcodeBuildRunner {
         )
     }
 
-    private func findBuiltApp(derivedDataPath: String, scheme: String, configuration: String) throws -> String {
-        let buildDir = "\(derivedDataPath)/Build/Products/\(configuration)-iphonesimulator"
+    private func findBuiltApp(
+        derivedDataPath: String,
+        scheme: String,
+        configuration: String,
+        isPhysicalDevice: Bool = false
+    ) throws -> String {
+        // Physical devices use "iphoneos", simulators use "iphonesimulator"
+        let sdk = isPhysicalDevice ? "iphoneos" : "iphonesimulator"
+        let buildDir = "\(derivedDataPath)/Build/Products/\(configuration)-\(sdk)"
 
         let contents = try FileManager.default.contentsOfDirectory(atPath: buildDir)
         guard let app = contents.first(where: { $0.hasSuffix(".app") }) else {

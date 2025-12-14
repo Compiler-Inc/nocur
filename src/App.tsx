@@ -10,6 +10,8 @@ import { Onboarding } from "@/components/Onboarding";
 import { OpenInDropdown } from "@/components/OpenInDropdown";
 import { ContextReviewModal, RecordingData } from "@/components/ContextReviewModal";
 import { BottomPanel, BottomPanelHandle } from "@/components/BottomPanel";
+import { PlaybookModal } from "@/components/PlaybookModal";
+import { DeviceSelector } from "@/components/DeviceSelector";
 
 // DEBUG: Set to true to always show onboarding
 const DEBUG_SHOW_ONBOARDING = false;
@@ -52,6 +54,22 @@ interface BuildError {
 }
 
 type BuildStatus = "idle" | "building" | "success" | "failed";
+
+interface DeviceInfo {
+  id: string;
+  name: string;
+  model: string;
+  osVersion: string;
+  deviceType: "simulator" | "physical";
+  state: "booted" | "shutdown" | "connected" | "disconnected" | "unavailable";
+  isAvailable: boolean;
+}
+
+interface DeviceListResult {
+  devices: DeviceInfo[];
+  simulatorCount: number;
+  physicalCount: number;
+}
 
 interface GitInfo {
   branch: string;
@@ -142,8 +160,14 @@ const App = () => {
   const [showContextModal, setShowContextModal] = useState(false);
   const [pendingRecording, setPendingRecording] = useState<RecordingData | null>(null);
 
+  // ACE Playbook modal state
+  const [showPlaybookModal, setShowPlaybookModal] = useState(false);
+
   // Git info
   const [gitInfo, setGitInfo] = useState<GitInfo | null>(null);
+
+  // Device selection
+  const [selectedDevice, setSelectedDevice] = useState<DeviceInfo | null>(null);
 
   // Bottom panel state (terminal + build logs)
   const [showBottomPanel, setShowBottomPanel] = useState(false);
@@ -165,6 +189,40 @@ const App = () => {
     fetchGitInfo();
     const interval = setInterval(fetchGitInfo, 5000); // Refresh every 5s
     return () => clearInterval(interval);
+  }, []);
+
+  // Auto-select first available device on mount
+  useEffect(() => {
+    const loadSelectedDevice = async () => {
+      try {
+        // First, try to load previously selected device
+        const device = await invoke<DeviceInfo | null>("get_selected_device");
+        if (device) {
+          setSelectedDevice(device);
+          return;
+        }
+
+        // Otherwise, auto-select first active device
+        const result = await invoke<DeviceListResult>("list_devices");
+        const firstActive = result.devices.find(
+          (d) => (d.state === "booted" || d.state === "connected") && d.isAvailable
+        );
+        if (firstActive) {
+          setSelectedDevice(firstActive);
+          await invoke("set_selected_device", { device: firstActive });
+        } else if (result.devices.length > 0) {
+          // If no active device, select first available one
+          const firstAvailable = result.devices.find((d) => d.isAvailable);
+          if (firstAvailable) {
+            setSelectedDevice(firstAvailable);
+            await invoke("set_selected_device", { device: firstAvailable });
+          }
+        }
+      } catch (err) {
+        console.error("Failed to load device:", err);
+      }
+    };
+    loadSelectedDevice();
   }, []);
 
   // Listen to build events at App level
@@ -296,6 +354,7 @@ const App = () => {
       const result = await invoke<BuildResult>("build_project", {
         projectPath: PROJECT_PATH,
         scheme: PROJECT_SCHEME,
+        device: selectedDevice,
       });
 
       if (result.success) {
@@ -319,6 +378,7 @@ const App = () => {
       const result = await invoke<BuildResult>("run_project", {
         projectPath: PROJECT_PATH,
         scheme: PROJECT_SCHEME,
+        device: selectedDevice,
       });
 
       if (result.success) {
@@ -488,6 +548,11 @@ const App = () => {
             <div className={`h-2 w-2 rounded-full ${statusConfig[buildStatus].color}`} />
             <span className="text-xs text-text-secondary">{statusConfig[buildStatus].text}</span>
           </div>
+          <DeviceSelector
+            selectedDevice={selectedDevice}
+            onDeviceSelect={setSelectedDevice}
+            disabled={buildStatus === "building"}
+          />
           <button
             onClick={handleBuild}
             disabled={buildStatus === "building"}
@@ -503,6 +568,17 @@ const App = () => {
             ▶ Run
           </button>
           <div className="h-4 w-px bg-border ml-1" />
+          {/* ACE Playbook button */}
+          <button
+            onClick={() => setShowPlaybookModal(true)}
+            className="p-1.5 rounded hover:bg-hover text-text-tertiary hover:text-accent transition-colors"
+            title="ACE Playbook"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.746 0 3.332.477 4.5 1.253v13C19.832 18.477 18.246 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+            </svg>
+          </button>
+          {/* Settings button */}
           <button className="p-1.5 rounded hover:bg-hover text-text-tertiary hover:text-text-secondary transition-colors">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -614,6 +690,13 @@ const App = () => {
         }}
         onSend={handleContextSend}
         recordingData={pendingRecording}
+      />
+
+      {/* ACE Playbook Modal */}
+      <PlaybookModal
+        isOpen={showPlaybookModal}
+        onClose={() => setShowPlaybookModal(false)}
+        projectPath={ROOT_PROJECT_PATH}
       />
     </div>
   );

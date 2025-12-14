@@ -25,6 +25,13 @@ import { createInterface } from 'readline';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { spawn } from 'child_process';
+import {
+  ACEManager,
+  createACEManager,
+  extractUsedBullets,
+  Playbook,
+} from './ace/index.js';
+import { getLSPManager, resetLSPManager, createLSPTools } from './lsp/index.js';
 
 // Types for stdin commands
 interface StartCommand {
@@ -34,6 +41,10 @@ interface StartCommand {
   systemPrompt?: string;
   resumeSessionId?: string;
   skipPermissions?: boolean;
+  // ACE: Project ID for playbook lookup (calculated by Rust using its hash algorithm)
+  projectId?: string;
+  // ACE: Alternatively, pass the full playbook directly
+  playbook?: Playbook;
 }
 
 interface MessageCommand {
@@ -69,6 +80,11 @@ let resumeSessionId: string | null = null;
 let currentModel: string = 'sonnet';
 let workingDir: string = process.cwd();
 let nocurSwiftPath: string = '';
+
+// ACE (Agentic Context Engineering) state
+let aceManager: ACEManager | null = null;
+let currentPlaybook: Playbook | null = null;
+let aceEnabled: boolean = true; // Can be toggled via command
 
 // Helper to emit events to stdout
 function emit(event: OutputEvent) {
@@ -157,7 +173,16 @@ async function saveImageToTemp(input: string): Promise<string> {
 }
 
 // Create nocur-swift MCP tools server
-function createNocurSwiftServer(swiftPath: string) {
+function createNocurSwiftServer(_swiftPath: string) {
+  // Initialize LSP manager with progress callback
+  const lspManager = getLSPManager({
+    onProgress: (msg) => emit({ type: 'lsp_progress', message: msg }),
+    onError: (msg) => logError(`[LSP] ${msg}`),
+  });
+
+  // Create LSP tools
+  const lspTools = createLSPTools(lspManager, workingDir);
+
   return createSdkMcpServer({
     name: 'nocur-swift',
     version: '1.0.0',
@@ -779,6 +804,9 @@ function createNocurSwiftServer(swiftPath: string) {
           return { content: [{ type: 'text' as const, text: output }] };
         }
       ),
+
+      // LSP Tools for Swift code intelligence
+      ...lspTools,
     ],
   });
 }
@@ -866,18 +894,45 @@ async function processQuery(prompt: string, options: {
   const iosAppend = `
 iOS simulator tools available: app_run, app_build, app_launch, app_kill, sim_screenshot, sim_logs, ui_interact, ui_hierarchy, ui_find, app_crashes, app_context, project_add_files, project_analyze, verify_implementation.
 
+Swift LSP tools available for code intelligence: lsp_hover (get type info), lsp_definition (go to definition), lsp_references (find usages), lsp_symbols (file outline), lsp_diagnostics (compiler errors), lsp_workspace_symbol (search symbols). Use these to understand Swift code structure and types before making changes.
+
 Use WebSearch for iOS 26 / post-2025 Apple APIs (not in training data).
 
 After creating new .swift files, call project_add_files to add them to the Xcode project.`;
 
+  // ACE: Build playbook context addition if enabled
+  let acePromptAddition = '';
+  let bulletsIncluded: string[] = [];
+
+  if (aceEnabled && aceManager && currentPlaybook) {
+    const aceResult = aceManager.getSystemPromptAddition(currentPlaybook);
+    if (aceResult) {
+      acePromptAddition = `\n\n${aceResult.promptAddition}`;
+      bulletsIncluded = aceResult.bulletsIncluded;
+      logError(`[ACE] Injected ${bulletsIncluded.length} bullets into context`);
+    }
+  }
+
+  // Track task for potential reflection
+  const taskStartTime = Date.now();
+  let fullAssistantResponse = '';
+  let queryOutcome: 'success' | 'failure' | 'unknown' = 'unknown';
+
   try {
+    // Build the full append: iOS tools + custom prompt + ACE playbook
+    const fullAppend = [
+      iosAppend,
+      options.systemPrompt || '',
+      acePromptAddition,
+    ].filter(Boolean).join('\n\n');
+
     const queryOptions: Record<string, unknown> = {
       model: resolveModel(options.model),
       // Use Claude Code's preset system prompt instead of custom one
       systemPrompt: {
         type: 'preset',
         preset: 'claude_code',
-        append: options.systemPrompt ? `${iosAppend}\n\n${options.systemPrompt}` : iosAppend,
+        append: fullAppend,
       },
       settingSources: ['project'],  // Load CLAUDE.md from working directory
       mcpServers: { 'nocur-swift': nocurServer },
@@ -907,6 +962,13 @@ After creating new .swift files, call project_add_files to add them to the Xcode
         'mcp__nocur-swift__project_add_files',
         'mcp__nocur-swift__project_analyze',
         'mcp__nocur-swift__verify_implementation',
+        // LSP tools for Swift code intelligence
+        'mcp__nocur-swift__lsp_hover',
+        'mcp__nocur-swift__lsp_definition',
+        'mcp__nocur-swift__lsp_references',
+        'mcp__nocur-swift__lsp_symbols',
+        'mcp__nocur-swift__lsp_diagnostics',
+        'mcp__nocur-swift__lsp_workspace_symbol',
       ],
       cwd: workingDir,
     };
@@ -958,9 +1020,11 @@ After creating new .swift files, call project_add_files to add them to the Xcode
 
         for (const block of content) {
           if (block.type === 'text') {
+            const text = block.text as string;
+            fullAssistantResponse += text + '\n'; // Track for ACE bullet extraction
             emit({
               type: 'assistant',
-              content: block.text as string,
+              content: text,
             });
           } else if (block.type === 'tool_use') {
             emit({
@@ -994,10 +1058,19 @@ After creating new .swift files, call project_add_files to add them to the Xcode
       // Handle result
       else if (msg.type === 'result') {
         const usage = msg.usage as Record<string, number> | undefined;
+        const subtype = msg.subtype as string;
+
+        // Track outcome for ACE reflection
+        if (subtype === 'end_turn' || subtype === 'success') {
+          queryOutcome = 'success';
+        } else if (subtype === 'error' || subtype === 'max_turns') {
+          queryOutcome = 'failure';
+        }
+
         emit({
           type: 'result',
           content: msg.result as string || '',
-          subtype: msg.subtype as string,
+          subtype,
           usage: usage ? {
             inputTokens: usage.input_tokens,
             outputTokens: usage.output_tokens,
@@ -1010,13 +1083,58 @@ After creating new .swift files, call project_add_files to add them to the Xcode
         });
       }
     }
+
+    // ACE: Extract used bullets from response and emit for tracking
+    if (aceEnabled && bulletsIncluded.length > 0) {
+      const usedBullets = extractUsedBullets(fullAssistantResponse);
+      if (usedBullets.length > 0) {
+        logError(`[ACE] Bullets used: ${usedBullets.join(', ')}`);
+        emit({
+          type: 'ace_bullets_used',
+          bulletsUsed: usedBullets,
+          bulletsIncluded,
+          outcome: queryOutcome,
+        });
+      }
+    }
   } catch (error) {
+    queryOutcome = 'failure';
     emit({
       type: 'error',
       message: error instanceof Error ? error.message : String(error),
     });
   } finally {
     currentQuery = null;
+
+    // ACE: Emit task completion for potential reflection
+    if (aceEnabled && currentPlaybook && currentSessionId) {
+      emit({
+        type: 'ace_task_complete',
+        sessionId: currentSessionId,
+        task: prompt.slice(0, 500), // Truncate for logging
+        outcome: queryOutcome,
+        duration: Date.now() - taskStartTime,
+      });
+    }
+  }
+}
+
+// Load playbook from local JSON file (mirroring Rust ace.rs storage)
+// projectId must be provided by Rust since it uses a different hash algorithm
+async function loadPlaybookFromStorage(projectId: string): Promise<Playbook | null> {
+  const fs = await import('fs/promises');
+  const path = await import('path');
+  const os = await import('os');
+
+  const aceDir = path.join(os.homedir(), '.config/nocur/ace/playbooks');
+  const playbookPath = path.join(aceDir, `${projectId}.json`);
+
+  try {
+    const content = await fs.readFile(playbookPath, 'utf-8');
+    return JSON.parse(content) as Playbook;
+  } catch {
+    // No playbook exists yet - that's OK
+    return null;
   }
 }
 
@@ -1029,7 +1147,45 @@ async function handleCommand(command: Command) {
       currentModel = command.model || 'sonnet';
       resumeSessionId = command.resumeSessionId || null;
 
-      emit({ type: 'ready', workingDir, model: currentModel, resumeSessionId });
+      // Initialize ACE
+      aceManager = createACEManager();
+      aceEnabled = true; // Reset to true for new session
+
+      try {
+        // ACE: Load playbook - prefer direct playbook, then projectId lookup
+        if (command.playbook) {
+          currentPlaybook = command.playbook;
+          logError(`[ACE] Using provided playbook with ${currentPlaybook.bullets.length} bullets`);
+        } else if (command.projectId) {
+          currentPlaybook = await loadPlaybookFromStorage(command.projectId);
+          if (currentPlaybook) {
+            logError(`[ACE] Loaded playbook with ${currentPlaybook.bullets.length} bullets for project ${command.projectId}`);
+          } else {
+            logError(`[ACE] No playbook found for project ${command.projectId}`);
+          }
+        } else {
+          currentPlaybook = null;
+          logError(`[ACE] No projectId provided, ACE disabled`);
+        }
+
+        // Check if ACE is enabled for this project
+        if (currentPlaybook && !currentPlaybook.aceEnabled) {
+          logError(`[ACE] Playbook loaded but ACE disabled for project`);
+          aceEnabled = false;
+        }
+      } catch (e) {
+        logError(`[ACE] Failed to load playbook: ${e}`);
+        currentPlaybook = null;
+      }
+
+      emit({
+        type: 'ready',
+        workingDir,
+        model: currentModel,
+        resumeSessionId,
+        aceEnabled: aceEnabled && (currentPlaybook?.aceEnabled ?? false),
+        acePlaybookBullets: currentPlaybook?.bullets.length || 0,
+      });
 
       // If there's an initial system prompt, we don't start a query yet
       // We wait for the first message
@@ -1069,6 +1225,8 @@ async function handleCommand(command: Command) {
 
     case 'stop':
       currentQuery = null;
+      // Clean up LSP manager
+      await resetLSPManager();
       emit({ type: 'stopped' });
       process.exit(0);
       break;

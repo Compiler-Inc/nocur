@@ -16,6 +16,7 @@ struct NocurCLI: AsyncParsableCommand {
             """,
         version: "0.1.0",
         subcommands: [
+            Device.self,
             Sim.self,
             App.self,
             UI.self,

@@ -8,6 +8,7 @@ use tauri::{State, Emitter, Manager};
 use regex::Regex;
 use parking_lot::Mutex;
 
+mod ace;
 mod claude;
 mod permissions;
 #[cfg(target_os = "macos")]
@@ -201,10 +202,134 @@ fn parse_build_errors(output: &str) -> (Vec<BuildError>, u32) {
     (errors, warnings)
 }
 
+// =============================================================================
+// Device Types
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub model: String,
+    pub os_version: String,
+    pub device_type: DeviceType,
+    pub state: DeviceState,
+    pub is_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceType {
+    Simulator,
+    Physical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceState {
+    Booted,
+    Shutdown,
+    Connected,
+    Disconnected,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceListResult {
+    pub devices: Vec<DeviceInfo>,
+    pub simulator_count: i32,
+    pub physical_count: i32,
+}
+
+/// App state for selected device
+pub struct AppState {
+    pub selected_device_id: Option<String>,
+    pub selected_device: Option<DeviceInfo>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            selected_device_id: None,
+            selected_device: None,
+        }
+    }
+}
+
+// =============================================================================
+// Device Commands
+// =============================================================================
+
+#[tauri::command]
+async fn list_devices() -> Result<DeviceListResult, String> {
+    // Run nocur-swift device list
+    let output = Command::new("swift")
+        .args(["run", "nocur-swift", "device", "list"])
+        .current_dir(format!("{}/nocur-swift", env!("CARGO_MANIFEST_DIR").replace("/src-tauri", "")))
+        .output()
+        .map_err(|e| format!("Failed to run nocur-swift: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("nocur-swift device list failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Parse the JSON output
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Failed to parse device list: {}", e))?;
+
+    // Extract the data field
+    let data = json.get("data")
+        .ok_or("Missing data field in response")?;
+    
+    let result: DeviceListResult = serde_json::from_value(data.clone())
+        .map_err(|e| format!("Failed to parse device list data: {}", e))?;
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn get_selected_device(
+    state: State<'_, Mutex<AppState>>,
+) -> Result<Option<DeviceInfo>, String> {
+    let app_state = state.lock();
+    Ok(app_state.selected_device.clone())
+}
+
+#[tauri::command]
+async fn set_selected_device(
+    device: DeviceInfo,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut app_state = state.lock();
+    app_state.selected_device_id = Some(device.id.clone());
+    app_state.selected_device = Some(device);
+    Ok(())
+}
+
+#[tauri::command]
+async fn clear_selected_device(
+    state: State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut app_state = state.lock();
+    app_state.selected_device_id = None;
+    app_state.selected_device = None;
+    Ok(())
+}
+
+// =============================================================================
+// Build Commands
+// =============================================================================
+
 #[tauri::command]
 async fn build_project(
     project_path: Option<String>,
     scheme: Option<String>,
+    device: Option<DeviceInfo>,
     app_handle: tauri::AppHandle,
 ) -> Result<BuildResult, String> {
     let start_time = Instant::now();
@@ -240,6 +365,22 @@ async fn build_project(
     emit_build_event(&app_handle, "output", &format!("Project: {}", project_file.display()));
     emit_build_event(&app_handle, "output", &format!("Scheme: {}", build_scheme));
 
+    // Determine destination based on device
+    let (destination, is_physical_device) = match &device {
+        Some(d) => {
+            let dest = match d.device_type {
+                DeviceType::Physical => format!("platform=iOS,id={}", d.id),
+                DeviceType::Simulator => format!("platform=iOS Simulator,id={}", d.id),
+            };
+            emit_build_event(&app_handle, "output", &format!("Device: {} ({})", d.name, if d.device_type == DeviceType::Physical { "physical" } else { "simulator" }));
+            (dest, d.device_type == DeviceType::Physical)
+        }
+        None => {
+            emit_build_event(&app_handle, "output", "Device: iPhone 16 Pro (simulator, default)");
+            ("platform=iOS Simulator,name=iPhone 16 Pro".to_string(), false)
+        }
+    };
+
     // Build xcodebuild command
     let mut cmd = Command::new("xcodebuild");
 
@@ -252,10 +393,16 @@ async fn build_project(
     cmd.args([
         "-scheme", &build_scheme,
         "-configuration", "Debug",
-        "-destination", "platform=iOS Simulator,name=iPhone 16 Pro",
+        "-destination", &destination,
         "-derivedDataPath", &format!("{}/DerivedData", project_dir),
-        "build"
     ]);
+
+    // Add -allowProvisioningUpdates for physical devices (automatic code signing)
+    if is_physical_device {
+        cmd.arg("-allowProvisioningUpdates");
+    }
+
+    cmd.arg("build");
 
     cmd.current_dir(&project_dir);
     cmd.stdout(Stdio::piped());
@@ -345,8 +492,9 @@ async fn build_project(
     if success {
         emit_build_event(&app_handle, "completed", &format!("Build succeeded in {:.1}s", build_time));
 
-        // Find the built app
-        let derived_data = format!("{}/DerivedData/Build/Products/Debug-iphonesimulator", project_dir);
+        // Find the built app - check both iphoneos (physical) and iphonesimulator paths
+        let sdk_suffix = if is_physical_device { "iphoneos" } else { "iphonesimulator" };
+        let derived_data = format!("{}/DerivedData/Build/Products/Debug-{}", project_dir, sdk_suffix);
         let app_path = std::fs::read_dir(&derived_data)
             .ok()
             .and_then(|entries| {
@@ -394,10 +542,11 @@ async fn build_project(
 async fn run_project(
     project_path: Option<String>,
     scheme: Option<String>,
+    device: Option<DeviceInfo>,
     app_handle: tauri::AppHandle,
 ) -> Result<BuildResult, String> {
     // First, build the project
-    let build_result = build_project(project_path.clone(), scheme, app_handle.clone()).await?;
+    let build_result = build_project(project_path.clone(), scheme, device.clone(), app_handle.clone()).await?;
 
     if !build_result.success {
         return Ok(build_result);
@@ -409,104 +558,203 @@ async fn run_project(
     let bundle_id = build_result.bundle_id.clone()
         .ok_or("Build succeeded but bundle ID not found")?;
 
-    // Check if any simulator is booted
-    emit_build_event(&app_handle, "output", "Checking simulator status...");
+    // Determine if this is a physical device or simulator
+    let is_physical_device = device.as_ref()
+        .map(|d| d.device_type == DeviceType::Physical)
+        .unwrap_or(false);
+    
+    let device_id = device.as_ref().map(|d| d.id.clone());
 
-    let list_output = Command::new("xcrun")
-        .args(["simctl", "list", "devices", "booted", "-j"])
-        .output()
-        .map_err(|e| format!("Failed to list simulators: {}", e))?;
+    if is_physical_device {
+        // Physical device: use devicectl for install and launch
+        let device_id = device_id.ok_or("Device ID required for physical device")?;
+        
+        emit_build_event(&app_handle, "output", &format!("Installing app to physical device {}...", device.as_ref().map(|d| d.name.as_str()).unwrap_or("unknown")));
 
-    let list_stdout = String::from_utf8_lossy(&list_output.stdout);
-    let has_booted_device = list_stdout.contains("\"state\" : \"Booted\"");
-
-    if !has_booted_device {
-        emit_build_event(&app_handle, "output", "No simulator booted, starting iPhone 16 Pro...");
-
-        // Boot the iPhone 16 Pro simulator
-        let boot_output = Command::new("xcrun")
-            .args(["simctl", "boot", "iPhone 16 Pro"])
+        // Install using devicectl
+        let install_output = Command::new("xcrun")
+            .args(["devicectl", "device", "install", "app", "--device", &device_id, &app_path])
             .output()
-            .map_err(|e| format!("Failed to boot simulator: {}", e))?;
+            .map_err(|e| format!("Failed to install app: {}", e))?;
 
-        if !boot_output.status.success() {
-            // Try with a different simulator name as fallback
-            let boot_fallback = Command::new("xcrun")
-                .args(["simctl", "boot", "iPhone 15 Pro"])
-                .output()
-                .map_err(|e| format!("Failed to boot fallback simulator: {}", e))?;
-
-            if !boot_fallback.status.success() {
-                let stderr = String::from_utf8_lossy(&boot_fallback.stderr);
-                emit_build_event(&app_handle, "error", &format!("Failed to boot simulator: {}", stderr));
-            }
+        if !install_output.status.success() {
+            let stderr = String::from_utf8_lossy(&install_output.stderr);
+            emit_build_event(&app_handle, "error", &format!("Install failed: {}", stderr));
+            return Ok(BuildResult {
+                success: false,
+                output: format!("Install failed: {}", stderr),
+                errors: vec![BuildError {
+                    file: None,
+                    line: None,
+                    column: None,
+                    message: stderr.to_string(),
+                }],
+                warnings: build_result.warnings,
+                build_time: build_result.build_time,
+                app_path: Some(app_path),
+                bundle_id: Some(bundle_id),
+            });
         }
 
-        // Open the Simulator app
-        let _ = Command::new("open")
-            .args(["-a", "Simulator"])
-            .output();
+        emit_build_event(&app_handle, "output", "Launching app on physical device...");
 
-        // Wait a moment for simulator to boot
-        emit_build_event(&app_handle, "output", "Waiting for simulator to boot...");
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // Launch using devicectl
+        let launch_output = Command::new("xcrun")
+            .args(["devicectl", "device", "process", "launch", "--device", &device_id, &bundle_id])
+            .output()
+            .map_err(|e| format!("Failed to launch app: {}", e))?;
+
+        if !launch_output.status.success() {
+            let stderr = String::from_utf8_lossy(&launch_output.stderr);
+            emit_build_event(&app_handle, "error", &format!("Launch failed: {}", stderr));
+            return Ok(BuildResult {
+                success: false,
+                output: format!("Launch failed: {}", stderr),
+                errors: vec![BuildError {
+                    file: None,
+                    line: None,
+                    column: None,
+                    message: stderr.to_string(),
+                }],
+                warnings: build_result.warnings,
+                build_time: build_result.build_time,
+                app_path: Some(app_path),
+                bundle_id: Some(bundle_id),
+            });
+        }
+
+        emit_build_event(&app_handle, "completed", &format!("App launched on device: {}", bundle_id));
+        
+        // Emit app-launched event so frontend can start log streaming
+        let _ = app_handle.emit("app-launched", serde_json::json!({
+            "bundleId": bundle_id.clone(),
+            "deviceId": device_id,
+            "deviceType": "physical",
+            "deviceName": device.as_ref().map(|d| d.name.clone()).unwrap_or_default()
+        }));
+    } else {
+        // Simulator: use simctl for install and launch
+        let sim_target = device_id.as_deref().unwrap_or("booted");
+
+        // Check if the target simulator is booted
+        emit_build_event(&app_handle, "output", "Checking simulator status...");
+
+        let list_output = Command::new("xcrun")
+            .args(["simctl", "list", "devices", "booted", "-j"])
+            .output()
+            .map_err(|e| format!("Failed to list simulators: {}", e))?;
+
+        let list_stdout = String::from_utf8_lossy(&list_output.stdout);
+        
+        // Check if our specific simulator is booted, or any simulator if using "booted"
+        let needs_boot = if sim_target == "booted" {
+            !list_stdout.contains("\"state\" : \"Booted\"")
+        } else {
+            // Check if the specific device ID is in the booted list
+            !list_stdout.contains(&format!("\"udid\" : \"{}\"", sim_target))
+        };
+
+        if needs_boot {
+            let boot_target = if sim_target == "booted" {
+                "iPhone 16 Pro"
+            } else {
+                sim_target
+            };
+            
+            emit_build_event(&app_handle, "output", &format!("Booting simulator {}...", boot_target));
+
+            let boot_output = Command::new("xcrun")
+                .args(["simctl", "boot", boot_target])
+                .output()
+                .map_err(|e| format!("Failed to boot simulator: {}", e))?;
+
+            if !boot_output.status.success() {
+                // Try with a different simulator name as fallback
+                let boot_fallback = Command::new("xcrun")
+                    .args(["simctl", "boot", "iPhone 15 Pro"])
+                    .output()
+                    .map_err(|e| format!("Failed to boot fallback simulator: {}", e))?;
+
+                if !boot_fallback.status.success() {
+                    let stderr = String::from_utf8_lossy(&boot_fallback.stderr);
+                    emit_build_event(&app_handle, "error", &format!("Failed to boot simulator: {}", stderr));
+                }
+            }
+
+            // Open the Simulator app
+            let _ = Command::new("open")
+                .args(["-a", "Simulator"])
+                .output();
+
+            // Wait a moment for simulator to boot
+            emit_build_event(&app_handle, "output", "Waiting for simulator to boot...");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+
+        emit_build_event(&app_handle, "output", "Installing app to simulator...");
+
+        // Install to simulator using simctl
+        let install_output = Command::new("xcrun")
+            .args(["simctl", "install", sim_target, &app_path])
+            .output()
+            .map_err(|e| format!("Failed to install app: {}", e))?;
+
+        if !install_output.status.success() {
+            let stderr = String::from_utf8_lossy(&install_output.stderr);
+            emit_build_event(&app_handle, "error", &format!("Install failed: {}", stderr));
+            return Ok(BuildResult {
+                success: false,
+                output: format!("Install failed: {}", stderr),
+                errors: vec![BuildError {
+                    file: None,
+                    line: None,
+                    column: None,
+                    message: stderr.to_string(),
+                }],
+                warnings: build_result.warnings,
+                build_time: build_result.build_time,
+                app_path: Some(app_path),
+                bundle_id: Some(bundle_id),
+            });
+        }
+
+        emit_build_event(&app_handle, "output", "Launching app...");
+
+        // Launch the app
+        let launch_output = Command::new("xcrun")
+            .args(["simctl", "launch", sim_target, &bundle_id])
+            .output()
+            .map_err(|e| format!("Failed to launch app: {}", e))?;
+
+        if !launch_output.status.success() {
+            let stderr = String::from_utf8_lossy(&launch_output.stderr);
+            emit_build_event(&app_handle, "error", &format!("Launch failed: {}", stderr));
+            return Ok(BuildResult {
+                success: false,
+                output: format!("Launch failed: {}", stderr),
+                errors: vec![BuildError {
+                    file: None,
+                    line: None,
+                    column: None,
+                    message: stderr.to_string(),
+                }],
+                warnings: build_result.warnings,
+                build_time: build_result.build_time,
+                app_path: Some(app_path),
+                bundle_id: Some(bundle_id),
+            });
+        }
+
+        emit_build_event(&app_handle, "completed", &format!("App launched: {}", bundle_id));
+        
+        // Emit app-launched event so frontend can start log streaming
+        let _ = app_handle.emit("app-launched", serde_json::json!({
+            "bundleId": bundle_id.clone(),
+            "deviceId": device_id,
+            "deviceType": "simulator",
+            "deviceName": device.as_ref().map(|d| d.name.clone()).unwrap_or("Simulator".to_string())
+        }));
     }
-
-    emit_build_event(&app_handle, "output", "Installing app to simulator...");
-
-    // Install to simulator using simctl
-    let install_output = Command::new("xcrun")
-        .args(["simctl", "install", "booted", &app_path])
-        .output()
-        .map_err(|e| format!("Failed to install app: {}", e))?;
-
-    if !install_output.status.success() {
-        let stderr = String::from_utf8_lossy(&install_output.stderr);
-        emit_build_event(&app_handle, "error", &format!("Install failed: {}", stderr));
-        return Ok(BuildResult {
-            success: false,
-            output: format!("Install failed: {}", stderr),
-            errors: vec![BuildError {
-                file: None,
-                line: None,
-                column: None,
-                message: stderr.to_string(),
-            }],
-            warnings: build_result.warnings,
-            build_time: build_result.build_time,
-            app_path: Some(app_path),
-            bundle_id: Some(bundle_id),
-        });
-    }
-
-    emit_build_event(&app_handle, "output", "Launching app...");
-
-    // Launch the app
-    let launch_output = Command::new("xcrun")
-        .args(["simctl", "launch", "booted", &bundle_id])
-        .output()
-        .map_err(|e| format!("Failed to launch app: {}", e))?;
-
-    if !launch_output.status.success() {
-        let stderr = String::from_utf8_lossy(&launch_output.stderr);
-        emit_build_event(&app_handle, "error", &format!("Launch failed: {}", stderr));
-        return Ok(BuildResult {
-            success: false,
-            output: format!("Launch failed: {}", stderr),
-            errors: vec![BuildError {
-                file: None,
-                line: None,
-                column: None,
-                message: stderr.to_string(),
-            }],
-            warnings: build_result.warnings,
-            build_time: build_result.build_time,
-            app_path: Some(app_path),
-            bundle_id: Some(bundle_id),
-        });
-    }
-
-    emit_build_event(&app_handle, "completed", &format!("App launched: {}", bundle_id));
 
     Ok(BuildResult {
         success: true,
@@ -2724,6 +2972,89 @@ fn get_shell_env() -> std::collections::HashMap<String, String> {
     std::env::vars().collect()
 }
 
+// ============================================================================
+// ACE (Agentic Context Engineering) Commands
+// ============================================================================
+
+#[tauri::command]
+fn ace_get_config() -> ace::ACEConfig {
+    ace::load_ace_config()
+}
+
+#[tauri::command]
+fn ace_save_config(config: ace::ACEConfig) -> Result<(), String> {
+    ace::save_ace_config(&config)
+}
+
+#[tauri::command]
+fn ace_get_playbook(project_path: String) -> Result<Option<ace::Playbook>, String> {
+    ace::load_playbook(&project_path)
+}
+
+#[tauri::command]
+fn ace_get_or_create_playbook(project_path: String) -> Result<ace::Playbook, String> {
+    ace::get_or_create_playbook(&project_path)
+}
+
+#[tauri::command]
+fn ace_save_playbook(playbook: ace::Playbook) -> Result<(), String> {
+    ace::save_playbook(&playbook)
+}
+
+#[tauri::command]
+fn ace_add_bullet(
+    project_path: String,
+    section: ace::BulletSection,
+    content: String,
+) -> Result<ace::Bullet, String> {
+    ace::add_bullet(&project_path, section, content)
+}
+
+#[tauri::command]
+fn ace_update_bullet(
+    project_path: String,
+    bullet_id: String,
+    content: String,
+) -> Result<ace::Bullet, String> {
+    ace::update_bullet(&project_path, &bullet_id, content)
+}
+
+#[tauri::command]
+fn ace_delete_bullet(project_path: String, bullet_id: String) -> Result<(), String> {
+    ace::delete_bullet(&project_path, &bullet_id)
+}
+
+#[tauri::command]
+fn ace_update_bullet_tags(
+    project_path: String,
+    tags: Vec<ace::BulletTagEntry>,
+) -> Result<(), String> {
+    ace::update_bullet_tags(&project_path, tags)
+}
+
+#[tauri::command]
+fn ace_set_enabled(project_path: String, enabled: bool) -> Result<(), String> {
+    ace::set_ace_enabled(&project_path, enabled)
+}
+
+#[tauri::command]
+fn ace_get_reflections(project_path: String) -> Result<Vec<ace::StoredReflection>, String> {
+    ace::load_reflections(&project_path)
+}
+
+#[tauri::command]
+fn ace_save_reflection(
+    project_path: String,
+    reflection: ace::StoredReflection,
+) -> Result<(), String> {
+    ace::save_reflection(&project_path, reflection)
+}
+
+#[tauri::command]
+fn ace_list_playbooks() -> Result<Vec<String>, String> {
+    ace::list_playbooks()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "macos")]
@@ -2736,7 +3067,8 @@ pub fn run() {
         .plugin(tauri_plugin_pty::init())
         .plugin(tauri_plugin_os::init())
         .manage(Mutex::new(ClaudeState::new()))
-        .manage(Mutex::new(PermissionState::new()));
+        .manage(Mutex::new(PermissionState::new()))
+        .manage(Mutex::new(AppState::default()));
 
     #[cfg(target_os = "macos")]
     {
@@ -2766,6 +3098,10 @@ pub fn run() {
             open_claude_login,
             build_project,
             run_project,
+            list_devices,
+            get_selected_device,
+            set_selected_device,
+            clear_selected_device,
             take_screenshot,
             get_view_hierarchy,
             load_image_from_path,
@@ -2808,6 +3144,20 @@ pub fn run() {
             // Terminal
             run_terminal_command,
             get_shell_env,
+            // ACE (Agentic Context Engineering)
+            ace_get_config,
+            ace_save_config,
+            ace_get_playbook,
+            ace_get_or_create_playbook,
+            ace_save_playbook,
+            ace_add_bullet,
+            ace_update_bullet,
+            ace_delete_bullet,
+            ace_update_bullet_tags,
+            ace_set_enabled,
+            ace_get_reflections,
+            ace_save_reflection,
+            ace_list_playbooks,
             // Window capture (macOS only)
             #[cfg(target_os = "macos")]
             start_simulator_stream,
