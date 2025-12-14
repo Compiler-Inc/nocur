@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface DeviceInfo {
-  id: string;
+  id: string;                    // UDID for xcodebuild
+  coreDeviceId: string | null;   // CoreDevice UUID for devicectl (physical devices only)
   name: string;
   model: string;
   osVersion: string;

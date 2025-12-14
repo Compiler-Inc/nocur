@@ -56,7 +56,8 @@ interface BuildError {
 type BuildStatus = "idle" | "building" | "success" | "failed";
 
 interface DeviceInfo {
-  id: string;
+  id: string;                    // UDID for xcodebuild (works for both simulator and physical)
+  coreDeviceId: string | null;   // CoreDevice UUID (only for physical, used by devicectl)
   name: string;
   model: string;
   osVersion: string;

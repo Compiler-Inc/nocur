@@ -209,7 +209,8 @@ fn parse_build_errors(output: &str) -> (Vec<BuildError>, u32) {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
-    pub id: String,
+    pub id: String,                    // UDID for xcodebuild (works for both simulator and physical)
+    pub core_device_id: Option<String>, // CoreDevice UUID (only for physical, used by devicectl)
     pub name: String,
     pub model: String,
     pub os_version: String,
@@ -563,17 +564,21 @@ async fn run_project(
         .map(|d| d.device_type == DeviceType::Physical)
         .unwrap_or(false);
     
+    // For xcodebuild and simctl, use the regular id
     let device_id = device.as_ref().map(|d| d.id.clone());
+    // For devicectl, use core_device_id (falls back to id if not available)
+    let core_device_id = device.as_ref().map(|d| d.core_device_id.clone().unwrap_or_else(|| d.id.clone()));
 
     if is_physical_device {
         // Physical device: use devicectl for install and launch
-        let device_id = device_id.ok_or("Device ID required for physical device")?;
+        // devicectl requires the CoreDevice UUID, not the xcodebuild UDID
+        let devicectl_id = core_device_id.ok_or("Device ID required for physical device")?;
         
         emit_build_event(&app_handle, "output", &format!("Installing app to physical device {}...", device.as_ref().map(|d| d.name.as_str()).unwrap_or("unknown")));
 
         // Install using devicectl
         let install_output = Command::new("xcrun")
-            .args(["devicectl", "device", "install", "app", "--device", &device_id, &app_path])
+            .args(["devicectl", "device", "install", "app", "--device", &devicectl_id, &app_path])
             .output()
             .map_err(|e| format!("Failed to install app: {}", e))?;
 
@@ -600,7 +605,7 @@ async fn run_project(
 
         // Launch using devicectl
         let launch_output = Command::new("xcrun")
-            .args(["devicectl", "device", "process", "launch", "--device", &device_id, &bundle_id])
+            .args(["devicectl", "device", "process", "launch", "--device", &devicectl_id, &bundle_id])
             .output()
             .map_err(|e| format!("Failed to launch app: {}", e))?;
 
@@ -626,9 +631,10 @@ async fn run_project(
         emit_build_event(&app_handle, "completed", &format!("App launched on device: {}", bundle_id));
         
         // Emit app-launched event so frontend can start log streaming
+        // Use devicectl_id for log streaming since it uses devicectl
         let _ = app_handle.emit("app-launched", serde_json::json!({
             "bundleId": bundle_id.clone(),
-            "deviceId": device_id,
+            "deviceId": devicectl_id,
             "deviceType": "physical",
             "deviceName": device.as_ref().map(|d| d.name.clone()).unwrap_or_default()
         }));

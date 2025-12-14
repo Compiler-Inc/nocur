@@ -4,7 +4,8 @@ import Foundation
 
 /// Represents any iOS device - simulator or physical
 public struct DeviceInfo: Codable, Equatable {
-    public let id: String              // UDID for simulators, CoreDevice UUID for physical
+    public let id: String              // UDID for simulators, xcodebuild-compatible UDID for physical
+    public let coreDeviceId: String?   // CoreDevice UUID (only for physical devices, used by devicectl)
     public let name: String            // "iPhone 16 Pro" or "Atharva's iPhone"
     public let model: String           // "iPhone 16 Pro", "iPad Air"
     public let osVersion: String       // "18.0", "26.1"
@@ -14,6 +15,7 @@ public struct DeviceInfo: Codable, Equatable {
     
     public init(
         id: String,
+        coreDeviceId: String? = nil,
         name: String,
         model: String,
         osVersion: String,
@@ -22,6 +24,7 @@ public struct DeviceInfo: Codable, Equatable {
         isAvailable: Bool
     ) {
         self.id = id
+        self.coreDeviceId = coreDeviceId
         self.name = name
         self.model = model
         self.osVersion = osVersion
@@ -193,7 +196,7 @@ public final class DeviceManager {
         var devices: [DeviceInfo] = []
         
         for device in deviceList {
-            guard let identifier = device["identifier"] as? String,
+            guard let coreDeviceId = device["identifier"] as? String,
                   let deviceProps = device["deviceProperties"] as? [String: Any],
                   let hardwareProps = device["hardwareProperties"] as? [String: Any],
                   let connectionProps = device["connectionProperties"] as? [String: Any] else {
@@ -209,6 +212,28 @@ public final class DeviceManager {
             let name = deviceProps["name"] as? String ?? "Unknown Device"
             let marketingName = hardwareProps["marketingName"] as? String ?? "Unknown"
             let osVersion = deviceProps["osVersionNumber"] as? String ?? "Unknown"
+            
+            // Extract the xcodebuild-compatible UDID from potentialHostnames
+            // Format: ["device.local", "COREID.coredevice.local", "UDID.coredevice.local"]
+            // The UDID is typically the one that looks like "00008140-000E40A42402201C"
+            // (8 hex chars, dash, 16 hex chars = 25 total chars)
+            let potentialHostnames = connectionProps["potentialHostnames"] as? [String] ?? []
+            var xcodeBuildUdid: String = coreDeviceId  // Fallback to coreDeviceId
+            
+            for hostname in potentialHostnames {
+                if hostname.hasSuffix(".coredevice.local") {
+                    let potential = hostname.replacingOccurrences(of: ".coredevice.local", with: "")
+                    // UDID format: 8 hex chars, dash, 16 hex chars (e.g., 00008140-000E40A42402201C)
+                    // Total length is 25 characters with exactly one dash at position 8
+                    if potential.count == 25,
+                       potential.filter({ $0 == "-" }).count == 1,
+                       let dashIndex = potential.firstIndex(of: "-"),
+                       potential.distance(from: potential.startIndex, to: dashIndex) == 8 {
+                        xcodeBuildUdid = potential
+                        break
+                    }
+                }
+            }
             
             // Determine state from connection properties
             let pairingState = connectionProps["pairingState"] as? String ?? ""
@@ -234,7 +259,8 @@ public final class DeviceManager {
             }
             
             let info = DeviceInfo(
-                id: identifier,
+                id: xcodeBuildUdid,
+                coreDeviceId: coreDeviceId,
                 name: name,
                 model: marketingName,
                 osVersion: osVersion,
