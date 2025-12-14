@@ -124,6 +124,8 @@ enum ServiceCommand {
     },
     Message {
         content: String,
+        #[serde(rename = "agentMode")]
+        agent_mode: Option<String>,
     },
     Interrupt,
     ChangeModel {
@@ -349,11 +351,12 @@ impl ClaudeSession {
         self.model.as_ref()
     }
 
-    pub fn send_message(&self, message: &str, app_handle: AppHandle) -> Result<(), String> {
+    pub fn send_message(&self, message: &str, agent_mode: Option<&str>, app_handle: AppHandle) -> Result<(), String> {
         log::info!("Sending message to Claude: {}", truncate_to_char_boundary(message, 100));
 
         let cmd = ServiceCommand::Message {
             content: message.to_string(),
+            agent_mode: agent_mode.map(|s| s.to_string()),
         };
 
         let json_line = serde_json::to_string(&cmd)

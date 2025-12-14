@@ -943,6 +943,7 @@ async fn start_claude_session(
 #[tauri::command]
 async fn send_claude_message(
     message: String,
+    agent_mode: Option<String>,
     app_handle: tauri::AppHandle,
     state: State<'_, Mutex<ClaudeState>>,
 ) -> Result<(), String> {
@@ -954,7 +955,7 @@ async fn send_claude_message(
             "content": message
         }));
 
-        session.send_message(&message, app_handle)?;
+        session.send_message(&message, agent_mode.as_deref(), app_handle)?;
         Ok(())
     } else {
         Err("No Claude session active. Start a session first.".to_string())
@@ -2255,6 +2256,8 @@ pub struct UserPreferences {
     pub model: Option<String>,
     pub skills: Vec<String>,
     pub skip_permissions: bool,
+    #[serde(default)]
+    pub agent_mode: Option<String>,  // "build" or "plan"
     #[serde(default)]
     pub session_names: std::collections::HashMap<String, String>,
     /// Maps project path to active session ID

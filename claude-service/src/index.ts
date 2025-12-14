@@ -50,6 +50,7 @@ interface StartCommand {
 interface MessageCommand {
   type: 'message';
   content: string;
+  agentMode?: 'build' | 'plan';
 }
 
 interface InterruptCommand {
@@ -71,6 +72,60 @@ type Command = StartCommand | MessageCommand | InterruptCommand | ChangeModelCom
 interface OutputEvent {
   type: string;
   [key: string]: unknown;
+}
+
+
+// Plan mode system prompt - instructs Claude to be read-only
+const PLAN_MODE_PROMPT = `# Plan Mode - READ-ONLY
+
+You are in PLAN mode. You must NOT make any changes to files or the system.
+
+## STRICTLY FORBIDDEN in Plan Mode:
+- ANY file edits or writes (Edit tool, Write tool)
+- Running bash commands that modify state (git commit, git push, npm install, rm, mv, mkdir, touch, etc.)
+- Creating or deleting files
+- Making any changes to the codebase
+
+## You MAY in Plan Mode:
+- Read and analyze files (Read tool)
+- Search the codebase (Glob, Grep tools)
+- Run read-only commands (git diff, git log, git status, git show, ls, cat, head, tail, grep, find, wc, pwd)
+- Provide detailed analysis and recommendations
+- Create comprehensive implementation plans
+- Ask clarifying questions
+
+## Your Role in Plan Mode:
+Think deeply, analyze thoroughly, and create a comprehensive plan. Present your analysis clearly with:
+1. Understanding of the current state
+2. Proposed changes with reasoning
+3. Potential risks or considerations
+4. Step-by-step implementation plan
+
+The user will switch to Build mode when ready to implement your plan.`;
+
+// Patterns for allowed read-only bash commands in plan mode
+const PLAN_MODE_ALLOWED_BASH_PATTERNS = [
+  /^git\s+(diff|log|status|show|branch|remote|rev-parse)/,
+  /^ls\b/,
+  /^cat\b/,
+  /^head\b/,
+  /^tail\b/,
+  /^grep\b/,
+  /^rg\b/,
+  /^find\b/,
+  /^wc\b/,
+  /^file\b/,
+  /^pwd$/,
+  /^echo\b/,
+  /^which\b/,
+  /^type\b/,
+  /^stat\b/,
+  /^du\b/,
+  /^tree\b/,
+];
+
+function isCommandAllowedInPlanMode(command: string): boolean {
+  return PLAN_MODE_ALLOWED_BASH_PATTERNS.some(pattern => pattern.test(command.trim()));
 }
 
 // Service state
@@ -887,6 +942,7 @@ async function processQuery(prompt: string, options: {
   systemPrompt?: string;
   resumeSessionId?: string;
   skipPermissions?: boolean;
+  agentMode?: 'build' | 'plan';
 }) {
   const nocurServer = createNocurSwiftServer(nocurSwiftPath);
 
@@ -920,8 +976,12 @@ After creating new .swift files, call project_add_files to add them to the Xcode
   let queryOutcome: 'success' | 'failure' | 'unknown' = 'unknown';
 
   try {
-    // Build the full append: iOS tools + custom prompt + ACE playbook
+    // Plan mode: inject read-only instructions
+    const planModeAddition = options.agentMode === 'plan' ? PLAN_MODE_PROMPT : '';
+
+    // Build the full append: iOS tools + custom prompt + ACE playbook + plan mode
     const fullAppend = [
+      planModeAddition,  // Plan mode first so it takes precedence
       iosAppend,
       options.systemPrompt || '',
       acePromptAddition,
@@ -941,7 +1001,25 @@ After creating new .swift files, call project_add_files to add them to the Xcode
       maxOutputTokens: 16000,  // Limit per-response output (was 128000 - way too high)
       // No turn limit - let the agent work until it's done or hits context limits
       // The SDK will auto-compact conversation history to stay within context window
-      allowedTools: [
+      // In plan mode, restrict to read-only tools
+      allowedTools: options.agentMode === 'plan' ? [
+        // Read-only tools for plan mode
+        'Read', 'Glob', 'Grep', 'Bash',  // Bash will be filtered by command
+        // Our nocur-swift MCP tools (read-only ones)
+        'mcp__nocur-swift__sim_screenshot',
+        'mcp__nocur-swift__sim_list',
+        'mcp__nocur-swift__ui_hierarchy',
+        'mcp__nocur-swift__ui_find',
+        'mcp__nocur-swift__project_analyze',
+        'mcp__nocur-swift__lsp_hover',
+        'mcp__nocur-swift__lsp_definition',
+        'mcp__nocur-swift__lsp_references',
+        'mcp__nocur-swift__lsp_symbols',
+        'mcp__nocur-swift__lsp_diagnostics',
+        'mcp__nocur-swift__lsp_workspace_symbol',
+        // Web search
+        'WebSearch',
+      ] : [
         // Standard Claude Code tools
         'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash',
         // Our nocur-swift MCP tools
@@ -1202,6 +1280,7 @@ async function handleCommand(command: Command) {
         model: currentModel,
         skipPermissions: true, // For now, skip permissions in SDK mode
         resumeSessionId: resumeSessionId || undefined,
+        agentMode: command.agentMode || 'build',
       });
       // After first query, use the currentSessionId for subsequent queries
       // (the SDK creates a new session if we always pass resumeSessionId)

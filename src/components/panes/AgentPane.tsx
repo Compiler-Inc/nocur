@@ -48,6 +48,8 @@ interface Message {
   // Whether this response was truncated due to max turns
   hitMaxTurns?: boolean;
   numTurns?: number;
+  // Agent mode this message was sent/received in
+  agentMode?: "build" | "plan";
 }
 
 interface PermissionRequest {
@@ -80,6 +82,7 @@ interface UserPreferences {
   model: string | null;
   skills: string[];
   skipPermissions: boolean;
+  agentMode?: "build" | "plan";
 }
 
 interface SessionMessage {
@@ -780,6 +783,8 @@ export const AgentPane = ({
   const [pendingFileRefs, setPendingFileRefs] = useState<{ path: string; name: string }[]>([]);
   // Model selection and resume state
   const [selectedModel, setSelectedModel] = useState<string>("sonnet");
+  // Agent mode: build (normal) or plan (read-only analysis)
+  const [agentMode, setAgentMode] = useState<"build" | "plan">("build");
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -830,6 +835,9 @@ export const AgentPane = ({
         if (prefs.skipPermissions !== undefined) {
           setSkipPermissions(prefs.skipPermissions);
         }
+        if (prefs.agentMode) {
+          setAgentMode(prefs.agentMode);
+        }
         // Mark preferences as loaded after a short delay
         setTimeout(() => {
           prefsLoadedRef.current = true;
@@ -853,6 +861,7 @@ export const AgentPane = ({
             model: selectedModel,
             skills: availableSkills,
             skipPermissions: skipPermissions,
+            agentMode: agentMode,
           }
         });
         console.log("Saved preferences");
@@ -861,7 +870,7 @@ export const AgentPane = ({
       }
     };
     savePreferences();
-  }, [selectedModel, skipPermissions, availableSkills]);
+  }, [selectedModel, skipPermissions, availableSkills, agentMode]);
 
   // Keep skipPermissionsRef in sync with state AND update backend
   useEffect(() => {
@@ -1483,7 +1492,7 @@ export const AgentPane = ({
 
     try {
       console.log("📤 Calling send_claude_message...");
-      await invoke("send_claude_message", { message: userMessage });
+      await invoke("send_claude_message", { message: userMessage, agentMode: agentMode });
       console.log("📤 send_claude_message returned successfully");
     } catch (err) {
       console.error("📤 send_claude_message FAILED:", err);
@@ -1642,6 +1651,13 @@ export const AgentPane = ({
               {msg.type === "user" && (
                 <div className="flex justify-end">
                   <div className="bg-surface-overlay rounded-2xl px-4 py-2.5 max-w-[85%]">
+                    {msg.agentMode && (
+                      <div className={`text-[10px] mb-1 font-medium ${
+                        msg.agentMode === "plan" ? "text-violet-400" : "text-accent"
+                      }`}>
+                        {msg.agentMode === "plan" ? "▣ Plan" : "▣ Build"}
+                      </div>
+                    )}
                     <p className="text-text-primary text-[15px] leading-relaxed">
                       {msg.content}
                     </p>
@@ -1996,7 +2012,11 @@ export const AgentPane = ({
       {/* Input area */}
       <div className="border-t border-border-subtle bg-surface-base">
         <div className="w-full px-6 py-3">
-          <div className="bg-surface-raised border border-border rounded-xl">
+          <div className={`bg-surface-raised border rounded-xl transition-colors ${
+              agentMode === "plan" 
+                ? "border-violet-500/50 ring-1 ring-violet-500/20" 
+                : "border-border"
+            }`}>
             <ChatInput
               onSubmit={handleInputSubmit}
               onSlashCommand={(cmd) => {
@@ -2055,6 +2075,34 @@ export const AgentPane = ({
                         ))}
                       </div>
                     )}
+                  </div>
+
+                  {/* Agent Mode Toggle (Build/Plan) */}
+                  <div className="flex items-center rounded-lg bg-surface-overlay p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setAgentMode("build")}
+                      className={`px-2 py-1 text-xs rounded-md transition-all ${
+                        agentMode === "build"
+                          ? "bg-accent text-surface-base font-medium shadow-sm"
+                          : "text-text-tertiary hover:text-text-secondary"
+                      }`}
+                      title="Build mode - Full capabilities"
+                    >
+                      Build
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAgentMode("plan")}
+                      className={`px-2 py-1 text-xs rounded-md transition-all ${
+                        agentMode === "plan"
+                          ? "bg-violet-500 text-white font-medium shadow-sm"
+                          : "text-text-tertiary hover:text-text-secondary"
+                      }`}
+                      title="Plan mode - Read-only analysis"
+                    >
+                      Plan
+                    </button>
                   </div>
 
                   {/* Resume/New Session button */}
