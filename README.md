@@ -235,7 +235,7 @@ And then:
 - [x] UI interactions (tap, scroll, type)
 - [x] Build/launch/kill app lifecycle
 - [x] Claude Agent SDK integration
-- [ ] Enhanced view hierarchy (accessibility-based targeting)
+- [x] View hierarchy + element targeting (idb accessibility)
 - [ ] Log streaming and crash detection
 - [ ] Computer use integration
 - [ ] Multi-simulator support

@@ -29,7 +29,7 @@ The agent needs access to the RIGHT context at the RIGHT time:
 | **Screenshots** | Manual, saved to files | Auto-attached, agent can request anytime |
 | **Logs** | Not available | Real-time streaming, filterable |
 | **Stack Traces** | Not available | Auto-captured on crash, attached |
-| **View Hierarchy** | Useless XML dump | Structured, searchable, element IDs |
+| **View Hierarchy** | Structured idb accessibility tree | Rich queries + stable IDs + actions |
 
 **Two modes:**
 - **Agent pull**: Agent requests what it needs
@@ -141,11 +141,11 @@ User → Agent → Computer Use → Simulator
 
 ## Immediate Next Steps
 
-1. **Fix view hierarchy** - Make it return useful, targetable data
-2. **Add log streaming** - Real-time simulator logs in context
-3. **Add crash detection** - Auto-capture stack traces
-4. **Add web search for docs** - Agent pulls Apple docs when needed
-5. **Verification loop** - Action → Screenshot → Analyze → Retry/Continue
+1. **Add log streaming** - Real-time simulator logs in context
+2. **Add crash detection** - Auto-capture stack traces
+3. **Add web search for docs** - Agent pulls Apple docs when needed
+4. **Verification loop** - Action → Screenshot → Analyze → Retry/Continue
+5. **Multi-device support** - Smoothly switch sims + real devices
 
 ---
 

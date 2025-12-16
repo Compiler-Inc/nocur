@@ -15,6 +15,7 @@ Transform Nocur from a tool-assisted development environment into a fully autono
 ### What Works
 - **Screenshots**: `sim_screenshot` captures simulator state
 - **Basic UI interaction**: `ui_interact` can tap/type/scroll using coordinates
+- **View hierarchy + element targeting**: `ui_hierarchy`, `ui_find`, `tapElement*` use idb accessibility data
 - **Build/Launch**: `app_build`, `app_launch`, `app_kill` work
 - **idb integration**: Already using Facebook's idb for touch input
 
@@ -22,11 +23,10 @@ Transform Nocur from a tool-assisted development environment into a fully autono
 
 | Component | Current State | Problem |
 |-----------|---------------|---------|
-| **View Hierarchy** | Returns empty placeholder | `ViewInspector` has `// placeholder` comments, returns no real data |
-| **Element Targeting** | Broken | `tapElement`, `tapElementByLabel` fail because hierarchy is empty |
 | **Logs** | Not implemented | No way to see app logs or errors |
 | **Crash Detection** | Not implemented | No crash report capture |
 | **New API Docs** | Not implemented | Agent can't look up iOS 26 APIs |
+| **Verification loop** | Manual | No automatic action → screenshot → analyze → retry |
 
 ### Key Discovery
 
@@ -47,19 +47,11 @@ idb log --json -- --style json --predicate 'processImagePath contains "MyApp"'
 
 ## Implementation Plan
 
-### Phase 1: Fix View Hierarchy (Critical)
+### Phase 1: View Hierarchy + Targeting (Done)
 
 **File**: `nocur-swift/Sources/Core/Introspection/ViewInspector.swift`
 
-**Current Code** (broken):
-```swift
-private func captureAccessibilityElements(udid: String) async throws -> [AccessibilityElement] {
-    // Placeholder implementation - in production would capture real elements
-    return []  // <- THIS IS THE PROBLEM
-}
-```
-
-**Fix**: Use `idb ui describe-all --json --nested`
+**Status**: Implemented using `idb ui describe-all --json --nested` (parsed into a structured accessibility tree).
 
 **New Implementation**:
 ```swift
