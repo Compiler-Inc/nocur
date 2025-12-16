@@ -93,7 +93,7 @@ interface SessionMessage {
   toolsUsed?: Array<{ name: string; input?: string }>;
 }
 
-const PROJECT_DIR = "<REPO_ROOT>"; // TODO: Make dynamic
+const PROJECT_DIR = ""; // Set dynamically via project context
 
 // Memoized ReactMarkdown components to avoid re-creating on every render
 const MARKDOWN_COMPONENTS = {

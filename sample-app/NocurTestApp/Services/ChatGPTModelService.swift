@@ -5,7 +5,11 @@ import Foundation
 class ChatGPTModelService: AIModelService {
     let modelType: AIModelType = .appleChatGPT
 
-    private let openAIAPIKey = "***REMOVED***"
+    // API key should be loaded from environment or secure storage
+    // For demo purposes, this service will return an error if no key is configured
+    private var openAIAPIKey: String {
+        ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? ""
+    }
     private let baseURL = "https://api.openai.com/v1/chat/completions"
 
     func generateResponse(for message: String, conversationHistory: [ChatMessage]) async throws -> String {
@@ -42,6 +46,11 @@ class ChatGPTModelService: AIModelService {
             "max_tokens": 500,
             "temperature": 0.7
         ]
+
+        // Check for API key
+        guard !openAIAPIKey.isEmpty else {
+            return "ChatGPT API key not configured. Set OPENAI_API_KEY environment variable."
+        }
 
         // Make API request
         guard let url = URL(string: baseURL) else {

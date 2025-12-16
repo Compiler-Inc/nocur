@@ -461,10 +461,10 @@ async fn build_project(
     // Emit build started event
     emit_build_event(&app_handle, "started", &format!("Building {} ...", scheme.as_deref().unwrap_or("project")));
 
-    // Determine project path
-    let project_dir = project_path.clone().unwrap_or_else(|| {
-        "<REPO_ROOT>/sample-app".to_string()
-    });
+    // Determine project path - must be provided by the caller
+    let project_dir = project_path.clone().ok_or_else(|| {
+        "No project path provided. Please select a project first.".to_string()
+    })?;
 
     // Find .xcodeproj
     let project_file = std::fs::read_dir(&project_dir)

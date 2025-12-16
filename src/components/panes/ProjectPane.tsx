@@ -27,13 +27,8 @@ interface BuildError {
   message: string;
 }
 
-// Default project - will be replaced with actual project detection
-const defaultProject: ProjectInfo = {
-  name: "NocurTestApp",
-  path: "<REPO_ROOT>/sample-app",
-  scheme: "NocurTestApp",
-  bundleId: "com.nocur.NocurTestApp",
-};
+// No default project - users should select their own project
+const defaultProject: ProjectInfo | null = null;
 
 export const ProjectPane = () => {
   const [project] = useState<ProjectInfo | null>(defaultProject);

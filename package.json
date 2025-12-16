@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "description": "AI-powered iOS development verification",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Compiler-Inc/nocur.git"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

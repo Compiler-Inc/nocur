@@ -86,9 +86,9 @@ interface GitInfo {
 }
 
 // Default paths used when no project is selected via context
-// These are fallbacks for backwards compatibility
-const DEFAULT_PROJECT_PATH = "<REPO_ROOT>/sample-app";
-const DEFAULT_PROJECT_SCHEME = "NocurTestApp";
+// These are fallbacks for development - users should select their own project
+const DEFAULT_PROJECT_PATH = "";
+const DEFAULT_PROJECT_SCHEME = "";
 
 // Resizable divider component
 const ResizeHandle = ({

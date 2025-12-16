@@ -9,25 +9,33 @@ dist-ssr/
 # Tauri
 src-tauri/target/
 
+# Claude Code (local)
+/.claude/
+
 # IDE
 .vscode/*
 !.vscode/extensions.json
 .idea/
+*.xcworkspace
 
 # OS
 .DS_Store
 Thumbs.db
 
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 pnpm-debug.log*
 
-# Environment
+# Environment & Secrets
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+**/secrets/
+**/credentials/
 
 # TypeScript
 *.tsbuildinfo
@@ -38,3 +46,22 @@ pnpm-debug.log*
 xcuserdata/
 *.xcuserstate
 DerivedData/
+Packages/
+
+# Xcode
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+
+# Analysis/Reference repos (local development)
+_analysis/
+
+# Internal planning docs
+/.plan.md
+sample-app/**/PLAN.md
+
+# BFG cleanup reports
+*.bfg-report/
+
+# Tuist
+Derived/
+graph.dot

@@ -112,7 +112,7 @@ export const WelcomeScreen = () => {
   } = useProject();
 
   return (
-    <div className="h-screen w-screen bg-surface-base flex flex-col items-center justify-center animate-fade-in">
+    <div className="h-screen w-screen bg-surface-base flex flex-col items-center justify-center animate-fade-in pt-8">
       <div className="w-full max-w-md px-8">
         {/* Logo and Title */}
         <div className="text-center mb-10">
