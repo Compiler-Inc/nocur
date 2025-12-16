@@ -12,25 +12,6 @@ interface ClaudeEvent {
   toolInput: string | null;  // Contains filepath for agent_screenshot
 }
 
-interface FrameData {
-  image: string;
-  width: number;
-  height: number;
-  timestamp: number;
-}
-
-interface SimulatorWindowInfo {
-  window_id: number;
-  bounds: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  };
-  name: string;
-  owner_name: string;
-}
-
 // Log entry from simulator console
 interface SimulatorLogEntry {
   timestamp: number;
@@ -80,9 +61,6 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
   const [isCapturing, setIsCapturing] = useState(false);
   const [showHierarchy, setShowHierarchy] = useState(false);
   const [hierarchy, setHierarchy] = useState<string | null>(null);
-  const [isLiveMode, setIsLiveMode] = useState(false);
-  const [windowInfo, setWindowInfo] = useState<SimulatorWindowInfo | null>(null);
-  const [fps, setFps] = useState(0);
   const [capturedFrames, setCapturedFrames] = useState<CapturedFrame[]>([]);
   const [capturedLogs, setCapturedLogs] = useState<SimulatorLogEntry[]>([]);
   const [capturedCrashes, setCapturedCrashes] = useState<CrashReport[]>([]);
@@ -92,14 +70,12 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
   const [errorCount, setErrorCount] = useState(0);
   // Flag to prevent auto-restart after manual stop/discard
   const [manualStopFlag, setManualStopFlag] = useState(false);
-  const frameCountRef = useRef(0);
-  const lastFpsUpdateRef = useRef(Date.now());
   const lastCaptureRef = useRef<string | null>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const recordingStartRef = useRef<number>(0);
+  const captureInFlightRef = useRef(false);
 
   const captureScreenshot = async () => {
-    if (isLiveMode) return;
     setIsCapturing(true);
     try {
       const dataUrl = await invoke<string>("take_screenshot");
@@ -131,9 +107,6 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
       const startTime = Date.now();
       recordingStartRef.current = startTime;
 
-      // Start simulator video stream
-      await invoke("start_simulator_stream", { fps: 30 });
-
       // Start log streaming (capture all logs)
       try {
         await invoke("start_simulator_logs", { bundleId: null });
@@ -141,7 +114,6 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
         console.warn("Failed to start log streaming:", e);
       }
 
-      setIsLiveMode(true);
       setState("observing");
       setObservationStartTime(startTime);
       setCapturedFrames([]);
@@ -150,6 +122,43 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
       setErrorCount(0);
       setManualStopFlag(false); // Clear flag when manually starting
       lastCaptureRef.current = null;
+
+      // Clear any existing capture interval
+      if (captureIntervalRef.current) {
+        clearInterval(captureIntervalRef.current);
+        captureIntervalRef.current = null;
+      }
+
+      // Periodic screenshots during observation (no live embed)
+      const captureFrame = async () => {
+        if (captureInFlightRef.current) return;
+        captureInFlightRef.current = true;
+        try {
+          const dataUrl = await invoke<string>("take_screenshot");
+          setScreenshotUrl(dataUrl);
+
+          if (dataUrl && dataUrl !== lastCaptureRef.current) {
+            setCapturedFrames(prev => {
+              const newFrame = { image: dataUrl, timestamp: Date.now() };
+              return [...prev, newFrame].slice(-MAX_CAPTURED_FRAMES);
+            });
+            lastCaptureRef.current = dataUrl;
+          }
+        } catch (e) {
+          console.error("Failed to capture screenshot during observation:", e);
+          setState("disconnected");
+          if (captureIntervalRef.current) {
+            clearInterval(captureIntervalRef.current);
+            captureIntervalRef.current = null;
+          }
+        } finally {
+          captureInFlightRef.current = false;
+        }
+      };
+
+      // Capture immediately, then at interval
+      captureFrame();
+      captureIntervalRef.current = setInterval(captureFrame, FRAME_CAPTURE_INTERVAL);
     } catch (e) {
       console.error("Failed to start observation:", e);
       alert(`Failed to start observation. Is the Simulator running?`);
@@ -158,28 +167,13 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
 
   // Stop observing and capture final state
   const stopObserving = useCallback(async () => {
-    const endTime = Date.now();
-
     // Clear any active capture interval
     if (captureIntervalRef.current) {
       clearInterval(captureIntervalRef.current);
       captureIntervalRef.current = null;
     }
 
-    // Capture one final frame if we have a current screenshot
-    if (screenshotUrl && screenshotUrl !== lastCaptureRef.current) {
-      setCapturedFrames(prev => {
-        const newFrames = [...prev, { image: screenshotUrl, timestamp: endTime }];
-        return newFrames.slice(-MAX_CAPTURED_FRAMES);
-      });
-    }
-
-    // Stop video streaming
-    try {
-      await invoke("stop_simulator_stream");
-    } catch (e) {
-      console.error("Failed to stop stream:", e);
-    }
+    captureInFlightRef.current = false;
 
     // Stop log streaming and collect logs
     try {
@@ -200,16 +194,14 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
         bundleId: null,
         sinceTimestamp: Math.floor(recordingStartRef.current / 1000)
       });
-      setCapturedCrashes(crashes);
+    setCapturedCrashes(crashes);
     } catch (e) {
       console.warn("Failed to get crash reports:", e);
     }
 
-    setIsLiveMode(false);
     setState("captured");
-    setFps(0);
     setManualStopFlag(true); // Prevent auto-restart after manual stop
-  }, [screenshotUrl]);
+  }, []);
 
   // Send captured data to Claude
   const sendToClaude = useCallback(() => {
@@ -242,87 +234,13 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
 
   // Auto-start observing when app starts running (but not after manual stop/discard)
   useEffect(() => {
-    if (isAppRunning && !isLiveMode && state !== "captured" && !manualStopFlag) {
+    if (isAppRunning && state !== "captured" && !manualStopFlag) {
       const timer = setTimeout(() => {
         startObserving();
       }, 500);
       return () => clearTimeout(timer);
     }
-  }, [isAppRunning, isLiveMode, state, manualStopFlag, startObserving]);
-
-  // Listen for frame events when in live mode
-  useEffect(() => {
-    if (!isLiveMode) return;
-
-    let unlistenFrame: UnlistenFn | undefined;
-    let unlistenWindow: UnlistenFn | undefined;
-    let unlistenDisconnect: UnlistenFn | undefined;
-
-    const setup = async () => {
-      unlistenFrame = await listen<FrameData>("simulator-frame", (event) => {
-        setScreenshotUrl(event.payload.image);
-
-        // Update FPS counter
-        frameCountRef.current++;
-        const now = Date.now();
-        if (now - lastFpsUpdateRef.current >= 1000) {
-          setFps(frameCountRef.current);
-          frameCountRef.current = 0;
-          lastFpsUpdateRef.current = now;
-        }
-      });
-
-      unlistenWindow = await listen<SimulatorWindowInfo>("simulator-window-found", (event) => {
-        setWindowInfo(event.payload);
-      });
-
-      unlistenDisconnect = await listen("simulator-disconnected", () => {
-        setIsLiveMode(false);
-        setState("disconnected");
-        setFps(0);
-      });
-    };
-
-    setup();
-
-    return () => {
-      if (unlistenFrame) unlistenFrame();
-      if (unlistenWindow) unlistenWindow();
-      if (unlistenDisconnect) unlistenDisconnect();
-    };
-  }, [isLiveMode]);
-
-  // Capture frames periodically during observation
-  useEffect(() => {
-    if (state !== "observing" || !isLiveMode) {
-      // Clear any existing interval when not observing
-      if (captureIntervalRef.current) {
-        clearInterval(captureIntervalRef.current);
-        captureIntervalRef.current = null;
-      }
-      return;
-    }
-
-    // Capture a frame every FRAME_CAPTURE_INTERVAL ms
-    captureIntervalRef.current = setInterval(() => {
-      if (screenshotUrl && screenshotUrl !== lastCaptureRef.current) {
-        setCapturedFrames(prev => {
-          const newFrame = { image: screenshotUrl, timestamp: Date.now() };
-          const newFrames = [...prev, newFrame];
-          // Keep only the last MAX_CAPTURED_FRAMES
-          return newFrames.slice(-MAX_CAPTURED_FRAMES);
-        });
-        lastCaptureRef.current = screenshotUrl;
-      }
-    }, FRAME_CAPTURE_INTERVAL);
-
-    return () => {
-      if (captureIntervalRef.current) {
-        clearInterval(captureIntervalRef.current);
-        captureIntervalRef.current = null;
-      }
-    };
-  }, [state, isLiveMode, screenshotUrl]);
+  }, [isAppRunning, state, manualStopFlag, startObserving]);
 
   // Listen for log events during recording
   useEffect(() => {
@@ -382,8 +300,6 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
         // This keeps the preview in sync with what Claude is actually seeing
         if (eventType === "agent_screenshot" && content) {
           console.log("[SimulatorPane] Received agent screenshot filepath:", content);
-          // Switch away from live mode to show the static screenshot
-          setIsLiveMode(false);
           // Content now contains filepath, convert to asset URL
           const assetUrl = convertFileSrc(content);
           setScreenshotUrl(assetUrl);
@@ -590,7 +506,7 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
           {state === "observing" ? (
             <>
               <div className="w-2 h-2 rounded-full bg-error animate-pulse" />
-              <span className="text-xs text-error font-medium">Recording · {fps > 0 ? `${fps} fps` : "..."}</span>
+              <span className="text-xs text-error font-medium">Recording</span>
             </>
           ) : state === "captured" ? (
             <>
@@ -602,15 +518,12 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
               <div className="w-1.5 h-1.5 rounded-full bg-text-tertiary" />
               <span className="text-xs text-text-tertiary font-mono">No Simulator</span>
             </>
-          ) : !isLiveMode && screenshotUrl ? (
+          ) : screenshotUrl ? (
             <>
               <div className="w-1.5 h-1.5 rounded-full bg-accent" />
               <span className="text-xs text-accent font-mono">Agent View</span>
             </>
           ) : null}
-          {windowInfo && isLiveMode && (
-            <span className="text-xs text-text-tertiary ml-2">· {windowInfo.name}</span>
-          )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
           {state !== "observing" && state !== "captured" && (
@@ -633,7 +546,7 @@ export const SimulatorPane = ({ isAppRunning, onCapture }: SimulatorPaneProps) =
           )}
           <button
             onClick={captureScreenshot}
-            disabled={isCapturing || isLiveMode}
+            disabled={isCapturing || state === "observing"}
             className="p-2 rounded hover:bg-hover text-text-tertiary hover:text-text-primary transition-colors disabled:opacity-50"
             title="Take Screenshot"
           >

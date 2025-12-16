@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tauri::{AppHandle, Emitter};
@@ -113,6 +114,8 @@ enum ServiceCommand {
     Start {
         #[serde(rename = "workingDir")]
         working_dir: String,
+        #[serde(rename = "nocurSwiftPath")]
+        nocur_swift_path: Option<String>,
         model: Option<String>,
         #[serde(rename = "resumeSessionId")]
         resume_session_id: Option<String>,
@@ -207,17 +210,54 @@ impl ClaudeSession {
             log::info!("Model: {}", model.as_str());
         }
 
-        // Path to the Node.js service
-        let service_path = format!("{}/claude-service/dist/index.js", working_dir);
+        let repo_root = crate::paths::resolve_repo_root();
+        let service_path = std::env::var("NOCUR_CLAUDE_SERVICE_PATH")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| {
+                repo_root
+                    .as_ref()
+                    .map(|root| crate::paths::claude_service_entry(root))
+            })
+            .unwrap_or_else(|| PathBuf::from("claude-service/dist/index.js"));
+
+        if !service_path.exists() {
+            let expected = repo_root
+                .as_ref()
+                .map(|root| crate::paths::claude_service_entry(root))
+                .unwrap_or_else(|| PathBuf::from("claude-service/dist/index.js"));
+            return Err(format!(
+                "Claude service entry not found at {}. Build it with `cd claude-service && pnpm build`.",
+                expected.display()
+            ));
+        }
+
+        let service_cwd = repo_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let nocur_swift_path = crate::paths::resolve_nocur_swift_binary()
+            .map(|p| p.to_string_lossy().to_string());
 
         // Spawn the Node.js service
-        let mut child = Command::new("node")
-            .arg(&service_path)
-            .current_dir(working_dir)
+        let mut cmd = Command::new("node");
+        cmd.arg(&service_path)
+            .current_dir(&service_cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .env("NOCUR_PROJECT_DIR", working_dir);
+
+        if let Some(ref root) = repo_root {
+            cmd.env("NOCUR_REPO_ROOT", root);
+        }
+        if let Some(ref swift) = nocur_swift_path {
+            cmd.env("NOCUR_SWIFT_PATH", swift);
+        }
+
+        let mut child = cmd.spawn()
             .map_err(|e| format!("Failed to spawn claude-service: {}. Is Node.js installed?", e))?;
 
         log::info!("Claude SDK service spawned successfully");
@@ -316,6 +356,7 @@ impl ClaudeSession {
         // Send start command to initialize the service
         let start_cmd = ServiceCommand::Start {
             working_dir: working_dir.to_string(),
+            nocur_swift_path: nocur_swift_path.clone(),
             model: config.model.map(|m| m.as_str().to_string()),
             resume_session_id: config.resume_session_id,
             skip_permissions: config.skip_permissions,
@@ -434,16 +475,15 @@ impl ClaudeSession {
     pub fn stop(&self) {
         log::info!("Stopping Claude SDK service");
 
-        // Kill the child process FIRST for immediate termination
-        // Don't wait for graceful shutdown - user wants it stopped NOW
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(ref mut child) = *guard {
-                log::info!("Killing child process");
-                let _ = child.kill();
-                // Don't call child.wait() here - it blocks!
-                // The process will be reaped automatically on drop or by the OS
-            }
-            *guard = None;
+        // Kill the child process FIRST for immediate termination, but also reap it in a
+        // background thread to avoid zombie processes.
+        let child = self.child.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(mut child) = child {
+            log::info!("Killing child process");
+            let _ = child.kill();
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
 
         // Close stdin to signal the process should exit

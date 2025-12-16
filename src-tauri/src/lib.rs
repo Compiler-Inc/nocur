@@ -10,26 +10,39 @@ use parking_lot::Mutex;
 
 mod ace;
 mod claude;
+mod paths;
 mod menu;
 mod permissions;
 mod project;
-#[cfg(target_os = "macos")]
-mod window_capture;
 
 use claude::{ClaudeSession, ClaudeState, ClaudeModel, ClaudeSessionConfig, SavedSession};
 use permissions::{PermissionState, PermissionResponse};
-#[cfg(target_os = "macos")]
-use window_capture::WindowCaptureState;
 use std::sync::Arc;
 
-// Path to nocur-swift CLI
-fn nocur_swift_path() -> PathBuf {
-    // Use the release build for better performance
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest_dir)
-        .parent()
-        .unwrap()
-        .join("nocur-swift/.build/release/nocur-swift")
+fn nocur_swift_command(args: &[&str]) -> Command {
+    if let Some(bin) = paths::resolve_nocur_swift_binary() {
+        let mut cmd = Command::new(bin);
+        cmd.args(args);
+        return cmd;
+    }
+
+    // Fallback to `swift run` if the Swift package exists (dev environments).
+    if let Some(repo_root) = paths::resolve_repo_root() {
+        let swift_pkg_dir = repo_root.join("nocur-swift");
+        if swift_pkg_dir.join("Package.swift").exists() {
+            let mut cmd = Command::new("swift");
+            cmd.args(["run", "--package-path"]);
+            cmd.arg(&swift_pkg_dir);
+            cmd.arg("nocur-swift");
+            cmd.args(args);
+            return cmd;
+        }
+    }
+
+    // Final fallback: rely on PATH.
+    let mut cmd = Command::new("nocur-swift");
+    cmd.args(args);
+    cmd
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1094,8 +1107,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 #[tauri::command]
 async fn take_screenshot() -> Result<String, String> {
-    let output = Command::new(nocur_swift_path())
-        .args(["sim", "screenshot"])
+    let output = nocur_swift_command(&["sim", "screenshot"])
         .output()
         .map_err(|e| format!("Failed to run nocur-swift: {}", e))?;
 
@@ -1119,8 +1131,7 @@ async fn take_screenshot() -> Result<String, String> {
 
 #[tauri::command]
 async fn get_view_hierarchy() -> Result<String, String> {
-    let output = Command::new(nocur_swift_path())
-        .args(["ui", "hierarchy"])
+    let output = nocur_swift_command(&["ui", "hierarchy"])
         .output()
         .map_err(|e| format!("Failed to run nocur-swift: {}", e))?;
 
@@ -1129,24 +1140,6 @@ async fn get_view_hierarchy() -> Result<String, String> {
 }
 
 /// Load an image from a file path and return as base64 data URL
-#[tauri::command]
-async fn load_image_from_path(path: String) -> Result<String, String> {
-    let image_data = fs::read(&path)
-        .map_err(|e| format!("Failed to read image at {}: {}", path, e))?;
-
-    // Detect format from extension
-    let format = if path.ends_with(".png") {
-        "png"
-    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-        "jpeg"
-    } else {
-        "png" // default
-    };
-
-    let base64_data = BASE64.encode(&image_data);
-    Ok(format!("data:image/{};base64,{}", format, base64_data))
-}
-
 // Claude subprocess commands - uses JSON streaming mode
 #[tauri::command]
 async fn start_claude_session(
@@ -2211,16 +2204,6 @@ pub struct ClaudeCodeSession {
     pub message_count: u32,
 }
 
-/// Get project hash like Claude Code does (SHA256 of path)
-fn get_project_hash(path: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
-}
-
 /// Message from a session file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2673,101 +2656,6 @@ async fn set_active_session(project_path: String, session_id: String) -> Result<
     Ok(())
 }
 
-// ============ Window Capture Commands (macOS only) ============
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-async fn start_simulator_stream(
-    fps: Option<u32>,
-    app_handle: tauri::AppHandle,
-    state: State<'_, Arc<WindowCaptureState>>,
-) -> Result<(), String> {
-    // First, ensure Simulator.app is open
-    let _ = std::process::Command::new("open")
-        .arg("-a")
-        .arg("Simulator")
-        .spawn();
-
-    // Wait a moment for Simulator to open
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let fps = fps.unwrap_or(30);
-    window_capture::start_streaming(app_handle, state.inner().clone(), fps).await
-}
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-async fn stop_simulator_stream(
-    state: State<'_, Arc<WindowCaptureState>>,
-) -> Result<(), String> {
-    window_capture::stop_streaming(&state);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-async fn simulator_click(
-    x: f64,
-    y: f64,
-    state: State<'_, Arc<WindowCaptureState>>,
-) -> Result<(), String> {
-    let bounds = state.get_bounds().ok_or("No simulator window bounds")?;
-    window_capture::send_mouse_click(x, y, &bounds)
-}
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-async fn simulator_swipe(
-    start_x: f64,
-    start_y: f64,
-    end_x: f64,
-    end_y: f64,
-    duration_ms: Option<u64>,
-    state: State<'_, Arc<WindowCaptureState>>,
-) -> Result<(), String> {
-    let bounds = state.get_bounds().ok_or("No simulator window bounds")?;
-    let duration = duration_ms.unwrap_or(300);
-    window_capture::send_mouse_drag(start_x, start_y, end_x, end_y, duration, &bounds)
-}
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-async fn simulator_home() -> Result<(), String> {
-    // Use simctl to press home button
-    let output = Command::new("xcrun")
-        .args(["simctl", "io", "booted", "sendkey", "home"])
-        .output()
-        .map_err(|e| format!("Failed to press home: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Home button failed: {}", stderr));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-async fn focus_simulator() -> Result<(), String> {
-    // Use AppleScript to bring Simulator to front
-    let output = Command::new("osascript")
-        .args(["-e", "tell application \"Simulator\" to activate"])
-        .output()
-        .map_err(|e| format!("Failed to focus simulator: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Focus simulator failed: {}", stderr));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-async fn find_simulator_window() -> Result<window_capture::SimulatorWindowInfo, String> {
-    window_capture::find_simulator_window()
-}
-
 // ============ Simulator Log Streaming ============
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2821,7 +2709,7 @@ async fn start_simulator_logs(
 
     // Clear existing logs
     {
-        let mut logs = state.logs.write().unwrap();
+        let mut logs = state.logs.write().unwrap_or_else(|e| e.into_inner());
         logs.clear();
     }
 
@@ -2853,9 +2741,14 @@ async fn start_simulator_logs(
 
         // Store child PID for later killing
         let pid = child.id();
-        *state_clone.child_pid.write().unwrap() = Some(pid);
+        *state_clone.child_pid.write().unwrap_or_else(|e| e.into_inner()) = Some(pid);
 
-        let stdout = child.stdout.take().expect("Failed to capture stdout");
+        let Some(stdout) = child.stdout.take() else {
+            log::error!("Failed to capture log stream stdout");
+            state_clone.is_streaming.store(false, Ordering::SeqCst);
+            *state_clone.child_pid.write().unwrap_or_else(|e| e.into_inner()) = None;
+            return;
+        };
         let reader = BufReader::new(stdout);
 
         for line in reader.lines() {
@@ -2869,7 +2762,7 @@ async fn start_simulator_logs(
 
                 // Store in state
                 {
-                    let mut logs = state_clone.logs.write().unwrap();
+                    let mut logs = state_clone.logs.write().unwrap_or_else(|e| e.into_inner());
                     logs.push(entry.clone());
                     // Keep only last 1000 entries
                     if logs.len() > 1000 {
@@ -2887,7 +2780,7 @@ async fn start_simulator_logs(
         // Cleanup
         let _ = child.kill();
         state_clone.is_streaming.store(false, Ordering::SeqCst);
-        *state_clone.child_pid.write().unwrap() = None;
+        *state_clone.child_pid.write().unwrap_or_else(|e| e.into_inner()) = None;
     });
 
     Ok(())
@@ -2937,7 +2830,7 @@ async fn stop_simulator_logs(
     state.is_streaming.store(false, Ordering::SeqCst);
 
     // Kill the child process if running
-    if let Some(pid) = *state.child_pid.read().unwrap() {
+    if let Some(pid) = *state.child_pid.read().unwrap_or_else(|e| e.into_inner()) {
         let _ = Command::new("kill")
             .args(["-9", &pid.to_string()])
             .output();
@@ -2952,7 +2845,7 @@ async fn stop_simulator_logs(
 async fn get_simulator_logs(
     state: State<'_, Arc<SimulatorLogState>>,
 ) -> Result<Vec<SimulatorLogEntry>, String> {
-    let logs = state.logs.read().unwrap();
+    let logs = state.logs.read().unwrap_or_else(|e| e.into_inner());
     Ok(logs.clone())
 }
 
@@ -2962,7 +2855,7 @@ async fn get_simulator_logs(
 async fn clear_simulator_logs(
     state: State<'_, Arc<SimulatorLogState>>,
 ) -> Result<(), String> {
-    let mut logs = state.logs.write().unwrap();
+    let mut logs = state.logs.write().unwrap_or_else(|e| e.into_inner());
     logs.clear();
     Ok(())
 }
@@ -3033,7 +2926,7 @@ async fn start_physical_device_logs(
 
         // Store child PID for later killing
         let pid = child.id();
-        *state_clone.child_pid.write().unwrap() = Some(pid);
+        *state_clone.child_pid.write().unwrap_or_else(|e| e.into_inner()) = Some(pid);
 
         // Emit that we started streaming
         let _ = app_handle_clone.emit("device-log-started", serde_json::json!({
@@ -3041,7 +2934,15 @@ async fn start_physical_device_logs(
             "bundleId": bundle_id
         }));
 
-        let stdout = child.stdout.take().expect("Failed to capture stdout");
+        let Some(stdout) = child.stdout.take() else {
+            log::error!("Failed to capture physical device log stream stdout");
+            let _ = app_handle_clone.emit("device-log-error", serde_json::json!({
+                "error": "Failed to capture stdout".to_string()
+            }));
+            state_clone.is_streaming.store(false, Ordering::SeqCst);
+            *state_clone.child_pid.write().unwrap_or_else(|e| e.into_inner()) = None;
+            return;
+        };
         let stderr = child.stderr.take();
 
         // Read stdout in a thread
@@ -3143,7 +3044,7 @@ async fn start_physical_device_logs(
         }));
 
         state_clone.is_streaming.store(false, Ordering::SeqCst);
-        *state_clone.child_pid.write().unwrap() = None;
+        *state_clone.child_pid.write().unwrap_or_else(|e| e.into_inner()) = None;
     });
 
     Ok(())
@@ -3158,7 +3059,7 @@ async fn stop_physical_device_logs(
     state.is_streaming.store(false, Ordering::SeqCst);
 
     // Kill the child process if running
-    if let Some(pid) = *state.child_pid.read().unwrap() {
+    if let Some(pid) = *state.child_pid.read().unwrap_or_else(|e| e.into_inner()) {
         let _ = Command::new("kill")
             .args(["-9", &pid.to_string()])
             .output();
@@ -3402,20 +3303,22 @@ async fn list_project_files(
 }
 
 /// Write debug snapshot to file for agentic access
+#[cfg(debug_assertions)]
 #[tauri::command]
 async fn write_debug_snapshot(snapshot: String) -> Result<(), String> {
-    let debug_path = std::path::Path::new("/tmp/nocur-debug.json");
+    let debug_path = std::env::temp_dir().join("nocur-debug.json");
     fs::write(debug_path, &snapshot)
         .map_err(|e| format!("Failed to write debug snapshot: {}", e))?;
     Ok(())
 }
 
 /// Read debug snapshot from file
+#[cfg(debug_assertions)]
 #[tauri::command]
 async fn read_debug_snapshot() -> Result<String, String> {
-    let debug_path = std::path::Path::new("/tmp/nocur-debug.json");
+    let debug_path = std::env::temp_dir().join("nocur-debug.json");
     if debug_path.exists() {
-        fs::read_to_string(debug_path)
+        fs::read_to_string(&debug_path)
             .map_err(|e| format!("Failed to read debug snapshot: {}", e))
     } else {
         Ok("{}".to_string())
@@ -3430,6 +3333,29 @@ async fn save_screenshots_to_temp(
 ) -> Result<Vec<String>, String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+    fn sanitize_filename_component(input: &str) -> String {
+        const MAX_LEN: usize = 64;
+        let mut out = String::with_capacity(input.len().min(MAX_LEN));
+
+        for ch in input.chars() {
+            if out.len() >= MAX_LEN {
+                break;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                out.push(ch);
+            } else {
+                out.push('_');
+            }
+        }
+
+        let out = out.trim_matches(&['_', '.'][..]).to_string();
+        if out.is_empty() {
+            "recording".to_string()
+        } else {
+            out
+        }
+    }
+
     let temp_dir = std::env::temp_dir().join("nocur_recordings");
     fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("Failed to create temp dir: {}", e))?;
@@ -3440,6 +3366,7 @@ async fn save_screenshots_to_temp(
             .map(|d| d.as_secs().to_string())
             .unwrap_or_else(|_| "recording".to_string())
     });
+    let prefix = sanitize_filename_component(&prefix);
 
     let mut paths = Vec::new();
 
@@ -3466,35 +3393,52 @@ async fn save_screenshots_to_temp(
     Ok(paths)
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalResult {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
+#[tauri::command]
+fn get_shell_env(include_secrets: Option<bool>) -> std::collections::HashMap<String, String> {
+    // Allow opting into passing the full environment to the embedded terminal.
+    // Default is safe-by-default: pass only a minimal set of non-secret env vars.
+    if include_secrets.unwrap_or(false)
+        || std::env::var("NOCUR_FULL_SHELL_ENV").is_ok_and(|v| v == "1")
+    {
+        return std::env::vars().collect();
+    }
+
+    std::env::vars()
+        .filter(|(k, _)| is_safe_shell_env_key(k))
+        .collect()
 }
 
-#[tauri::command]
-async fn run_terminal_command(command: String, working_dir: String) -> Result<TerminalResult, String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .current_dir(&working_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to execute command: {}", e))?;
-
-    Ok(TerminalResult {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code().unwrap_or(-1),
-    })
-}
-
-#[tauri::command]
-fn get_shell_env() -> std::collections::HashMap<String, String> {
-    std::env::vars().collect()
+fn is_safe_shell_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "LOGNAME"
+            | "SHELL"
+            | "LANG"
+            | "TERM"
+            | "TMPDIR"
+            | "PWD"
+            | "SSH_AUTH_SOCK"
+            | "SSH_AGENT_PID"
+            | "EDITOR"
+            | "VISUAL"
+            | "PAGER"
+            | "GIT_EDITOR"
+            | "GIT_ASKPASS"
+            | "DEVELOPER_DIR"
+            | "SDKROOT"
+    ) || key.starts_with("LC_")
+        || key.starts_with("XDG_")
+        || key.starts_with("CARGO_")
+        || key.starts_with("RUSTUP_")
+        || key.starts_with("HOMEBREW_")
+        || key.starts_with("NVM_")
+        || key.starts_with("VOLTA_")
+        || key.starts_with("PNPM_")
+        || key.starts_with("NPM_")
+        || key.starts_with("NODE_")
 }
 
 // ============================================================================
@@ -3624,8 +3568,6 @@ fn validate_project_path(path: String) -> Result<project::ProjectValidation, Str
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "macos")]
-    let window_capture_state = Arc::new(WindowCaptureState::new());
-    #[cfg(target_os = "macos")]
     let log_state = Arc::new(SimulatorLogState::new());
     #[cfg(target_os = "macos")]
     let physical_device_log_state = Arc::new(PhysicalDeviceLogState::new());
@@ -3642,7 +3584,6 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     {
         builder = builder
-            .manage(window_capture_state)
             .manage(log_state)
             .manage(physical_device_log_state);
     }
@@ -3688,7 +3629,6 @@ pub fn run() {
             clear_selected_device,
             take_screenshot,
             get_view_hierarchy,
-            load_image_from_path,
             start_claude_session,
             send_claude_message,
             stop_claude_session,
@@ -3726,7 +3666,6 @@ pub fn run() {
             get_active_session,
             set_active_session,
             // Terminal
-            run_terminal_command,
             get_shell_env,
             // ACE (Agentic Context Engineering)
             ace_get_config,
@@ -3749,21 +3688,6 @@ pub fn run() {
             remove_from_recent_projects,
             clear_all_recent_projects,
             validate_project_path,
-            // Window capture (macOS only)
-            #[cfg(target_os = "macos")]
-            start_simulator_stream,
-            #[cfg(target_os = "macos")]
-            stop_simulator_stream,
-            #[cfg(target_os = "macos")]
-            simulator_click,
-            #[cfg(target_os = "macos")]
-            simulator_swipe,
-            #[cfg(target_os = "macos")]
-            simulator_home,
-            #[cfg(target_os = "macos")]
-            focus_simulator,
-            #[cfg(target_os = "macos")]
-            find_simulator_window,
             // Log streaming (macOS only)
             #[cfg(target_os = "macos")]
             start_simulator_logs,
@@ -3782,7 +3706,9 @@ pub fn run() {
             // Screenshot saving
             save_screenshots_to_temp,
             // Debug utilities
+            #[cfg(debug_assertions)]
             write_debug_snapshot,
+            #[cfg(debug_assertions)]
             read_debug_snapshot,
             // File autocomplete
             list_project_files,

@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 /**
  * Debug utilities for React/Tauri app
  * These can be called from console or via Tauri commands
- * Debug state is periodically written to /tmp/nocur-debug.json for agentic access
+ * Debug state is periodically written to the system temp dir as nocur-debug.json (debug builds only)
  */
 
 interface RenderInfo {
@@ -285,7 +285,7 @@ if (typeof window !== "undefined" && import.meta.env.DEV) {
     "%c[Debug] Debug utilities loaded. Use window.__DEBUG__ to access.",
     "color: #f59e0b; font-weight: bold"
   );
-  console.log("  - Debug snapshots written to /tmp/nocur-debug.json");
+  console.log("  - Debug snapshots written to your system temp dir as nocur-debug.json (debug builds only)");
 
   // Auto-start debug logging after a short delay (let app initialize)
   setTimeout(() => {

@@ -2,13 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter};
 
-const SOCKET_PATH: &str = "/tmp/nocur-permissions.sock";
+fn socket_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("nocur-permissions.sock")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,15 +64,16 @@ impl PermissionServer {
             *running = true;
         }
 
+        let socket_path = socket_path();
         // Remove existing socket file
-        let _ = std::fs::remove_file(SOCKET_PATH);
+        let _ = std::fs::remove_file(&socket_path);
 
         let pending = self.pending_requests.clone();
         let running = self.running.clone();
         let auto_approve = self.auto_approve.clone();
 
         thread::spawn(move || {
-            let listener = match UnixListener::bind(SOCKET_PATH) {
+            let listener = match UnixListener::bind(&socket_path) {
                 Ok(l) => l,
                 Err(e) => {
                     log::error!("Failed to bind permission socket: {}", e);
@@ -78,7 +82,12 @@ impl PermissionServer {
                 }
             };
 
-            log::info!("Permission server listening on {}", SOCKET_PATH);
+            // Restrict socket permissions to the current user.
+            if let Err(e) = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)) {
+                log::warn!("Failed to set permissions on {}: {}", socket_path.display(), e);
+            }
+
+            log::info!("Permission server listening on {}", socket_path.display());
 
             // Set socket to non-blocking for graceful shutdown
             listener.set_nonblocking(true).ok();
@@ -105,7 +114,7 @@ impl PermissionServer {
             }
 
             log::info!("Permission server stopped");
-            let _ = std::fs::remove_file(SOCKET_PATH);
+            let _ = std::fs::remove_file(&socket_path);
         });
     }
 
@@ -134,7 +143,14 @@ fn handle_connection(
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     // Read the request
-    let mut reader = BufReader::new(stream.try_clone().expect("Failed to clone stream"));
+    let stream_clone = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to clone stream: {}", e);
+            return;
+        }
+    };
+    let mut reader = BufReader::new(stream_clone);
     let mut line = String::new();
 
     if let Err(e) = reader.read_line(&mut line) {
@@ -167,6 +183,7 @@ fn handle_connection(
         if let Err(e) = writeln!(stream, "{}", response) {
             log::error!("Failed to write auto-approve response: {}", e);
         }
+        let _ = stream.flush();
         return;
     }
 
@@ -186,7 +203,7 @@ fn handle_connection(
     };
 
     // Create a channel for the response
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
 
     // Store the sender
     {
@@ -201,15 +218,30 @@ fn handle_connection(
     }
 
     // Wait for response (blocking with timeout)
-    let response = match rx.blocking_recv() {
-        Ok(r) => r,
-        Err(_) => {
-            log::warn!("Permission request timed out: {}", request_id);
-            // Clean up
-            pending.lock().remove(&request_id);
-            PermissionResponse {
-                decision: "block".to_string(),
-                reason: Some("Request timed out".to_string()),
+    let response = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match rx.try_recv() {
+                Ok(r) => break r,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        log::warn!("Permission request timed out: {}", request_id);
+                        // Clean up
+                        pending.lock().remove(&request_id);
+                        break PermissionResponse {
+                            decision: "block".to_string(),
+                            reason: Some("Request timed out".to_string()),
+                        };
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    pending.lock().remove(&request_id);
+                    break PermissionResponse {
+                        decision: "block".to_string(),
+                        reason: Some("Permission channel closed".to_string()),
+                    };
+                }
             }
         }
     };
@@ -223,6 +255,7 @@ fn handle_connection(
     if let Err(e) = writeln!(stream, "{}", response_json) {
         log::error!("Failed to write response: {}", e);
     }
+    let _ = stream.flush();
 }
 
 pub struct PermissionState {

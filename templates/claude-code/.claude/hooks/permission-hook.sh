@@ -4,7 +4,8 @@
 
 set -euo pipefail
 
-SOCKET_PATH="/tmp/nocur-permissions.sock"
+SOCKET_DIR="${TMPDIR:-/tmp}"
+SOCKET_PATH="${SOCKET_DIR%/}/nocur-permissions.sock"
 TIMEOUT=60 # seconds to wait for user response
 
 # Read the tool info from stdin

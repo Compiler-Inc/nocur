@@ -37,6 +37,7 @@ import { getLSPManager, resetLSPManager, createLSPTools } from './lsp/index.js';
 interface StartCommand {
   type: 'start';
   workingDir: string;
+  nocurSwiftPath?: string;
   model?: string;
   systemPrompt?: string;
   resumeSessionId?: string;
@@ -134,7 +135,14 @@ let currentSessionId: string | null = null;
 let resumeSessionId: string | null = null;
 let currentModel: string = 'sonnet';
 let workingDir: string = process.cwd();
-let nocurSwiftPath: string = '';
+type NocurSwiftRunner = {
+  command: string;
+  argsPrefix: string[];
+};
+let nocurSwiftRunner: NocurSwiftRunner = {
+  command: process.env.NOCUR_SWIFT_PATH || 'nocur-swift',
+  argsPrefix: [],
+};
 
 // ACE (Agentic Context Engineering) state
 let aceManager: ACEManager | null = null;
@@ -228,7 +236,7 @@ async function saveImageToTemp(input: string): Promise<string> {
 }
 
 // Create nocur-swift MCP tools server
-function createNocurSwiftServer(_swiftPath: string) {
+function createNocurSwiftServer() {
   // Initialize LSP manager with progress callback
   const lspManager = getLSPManager({
     onProgress: (msg) => emit({ type: 'lsp_progress', message: msg }),
@@ -876,7 +884,7 @@ interface NocurResult {
 // Helper to run nocur-swift commands - returns structured result, never throws
 async function runNocurSwift(args: string[]): Promise<NocurResult> {
   return new Promise((resolve) => {
-    const proc = spawn(nocurSwiftPath, args, {
+    const proc = spawn(nocurSwiftRunner.command, [...nocurSwiftRunner.argsPrefix, ...args], {
       cwd: workingDir,
     });
 
@@ -944,7 +952,7 @@ async function processQuery(prompt: string, options: {
   skipPermissions?: boolean;
   agentMode?: 'build' | 'plan';
 }) {
-  const nocurServer = createNocurSwiftServer(nocurSwiftPath);
+  const nocurServer = createNocurSwiftServer();
 
   // Use Claude Code's built-in system prompt with minimal iOS-specific additions
   // This gives us all of Claude Code's battle-tested behavior
@@ -1222,7 +1230,7 @@ async function handleCommand(command: Command) {
   switch (command.type) {
     case 'start':
       workingDir = command.workingDir;
-      nocurSwiftPath = `${workingDir}/nocur-swift/.build/release/nocur-swift`;
+      nocurSwiftRunner = await resolveNocurSwiftRunner(command.nocurSwiftPath);
       currentModel = command.model || 'sonnet';
       resumeSessionId = command.resumeSessionId || null;
 
@@ -1311,6 +1319,42 @@ async function handleCommand(command: Command) {
       process.exit(0);
       break;
   }
+}
+
+async function resolveNocurSwiftRunner(overridePath?: string): Promise<NocurSwiftRunner> {
+  const fs = await import('fs/promises');
+  const path = await import('path');
+
+  if (overridePath) {
+    return { command: overridePath, argsPrefix: [] };
+  }
+
+  if (process.env.NOCUR_SWIFT_PATH) {
+    return { command: process.env.NOCUR_SWIFT_PATH, argsPrefix: [] };
+  }
+
+  const repoRoot = process.env.NOCUR_REPO_ROOT || process.cwd();
+  const builtBin = path.join(repoRoot, 'nocur-swift/.build/release/nocur-swift');
+  try {
+    await fs.access(builtBin);
+    return { command: builtBin, argsPrefix: [] };
+  } catch {
+    // ignore
+  }
+
+  const pkgDir = path.join(repoRoot, 'nocur-swift');
+  try {
+    await fs.access(path.join(pkgDir, 'Package.swift'));
+    return {
+      command: 'swift',
+      argsPrefix: ['run', '--package-path', pkgDir, 'nocur-swift'],
+    };
+  } catch {
+    // ignore
+  }
+
+  logError('[nocur-swift] Binary not found; falling back to PATH (nocur-swift)');
+  return { command: 'nocur-swift', argsPrefix: [] };
 }
 
 // Main entry point

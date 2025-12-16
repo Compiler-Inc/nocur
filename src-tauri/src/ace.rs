@@ -8,6 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use sha2::{Digest, Sha256};
 
 /// Bullet section types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -134,6 +135,26 @@ impl Default for ACEConfig {
 
 /// Generate a project ID from a path
 pub fn generate_project_id(path: &str) -> String {
+    stable_project_id(path)
+}
+
+fn stable_project_id(path: &str) -> String {
+    // Prefer a canonical path so the same project gets the same ID even if
+    // opened via symlinks / relative paths.
+    let canonical = fs::canonicalize(path)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+
+    // Keep IDs short (matches legacy 16-hex format) while remaining stable.
+    digest.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+}
+
+fn legacy_project_id(path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -196,6 +217,26 @@ pub fn load_playbook(project_path: &str) -> Result<Option<Playbook>, String> {
     let path = playbooks_dir.join(format!("{}.json", project_id));
 
     if !path.exists() {
+        // Backward compatibility: migrate legacy DefaultHasher-based IDs.
+        let legacy_id = legacy_project_id(project_path);
+        let legacy_path = playbooks_dir.join(format!("{}.json", legacy_id));
+        if legacy_path.exists() {
+            let content = fs::read_to_string(&legacy_path)
+                .map_err(|e| format!("Failed to read playbook: {}", e))?;
+            let mut playbook: Playbook = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse playbook: {}", e))?;
+
+            playbook.project_id = project_id.clone();
+            playbook.project_path = project_path.to_string();
+            for bullet in &mut playbook.bullets {
+                bullet.project_id = project_id.clone();
+            }
+
+            save_playbook(&playbook)?;
+            let _ = fs::remove_file(&legacy_path);
+            return Ok(Some(playbook));
+        }
+
         return Ok(None);
     }
 
@@ -226,7 +267,7 @@ pub fn create_playbook(project_path: &str) -> Result<Playbook, String> {
     let project_id = generate_project_id(project_path);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     let playbook = Playbook {
@@ -265,7 +306,7 @@ fn generate_bullet_id(section: &BulletSection) -> String {
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis();
 
     let random: u32 = rand::random();
@@ -281,7 +322,7 @@ pub fn add_bullet(
     let mut playbook = get_or_create_playbook(project_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     let bullet = Bullet {
@@ -314,7 +355,7 @@ pub fn update_bullet(
     let mut playbook = get_or_create_playbook(project_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     let bullet = playbook
@@ -338,7 +379,7 @@ pub fn delete_bullet(project_path: &str, bullet_id: &str) -> Result<(), String> 
     let mut playbook = get_or_create_playbook(project_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     let bullet = playbook
@@ -364,7 +405,7 @@ pub fn update_bullet_tags(
     let mut playbook = get_or_create_playbook(project_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     for tag_entry in tags {
@@ -390,7 +431,7 @@ pub fn set_ace_enabled(project_path: &str, enabled: bool) -> Result<(), String> 
     let mut playbook = get_or_create_playbook(project_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     playbook.ace_enabled = enabled;
@@ -407,6 +448,29 @@ pub fn load_reflections(project_path: &str) -> Result<Vec<StoredReflection>, Str
     let path = reflections_dir.join(format!("{}.json", project_id));
 
     if !path.exists() {
+        // Backward compatibility: migrate legacy DefaultHasher-based IDs.
+        let legacy_id = legacy_project_id(project_path);
+        let legacy_path = reflections_dir.join(format!("{}.json", legacy_id));
+        if legacy_path.exists() {
+            let content = fs::read_to_string(&legacy_path)
+                .map_err(|e| format!("Failed to read reflections: {}", e))?;
+            let mut log: ReflectionsLog = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse reflections: {}", e))?;
+
+            log.project_id = project_id.clone();
+            for reflection in &mut log.reflections {
+                reflection.project_id = project_id.clone();
+            }
+
+            let migrated = log.reflections.clone();
+            let content = serde_json::to_string_pretty(&log)
+                .map_err(|e| format!("Failed to serialize reflections: {}", e))?;
+            fs::write(&path, content)
+                .map_err(|e| format!("Failed to write reflections: {}", e))?;
+            let _ = fs::remove_file(&legacy_path);
+            return Ok(migrated);
+        }
+
         return Ok(vec![]);
     }
 
@@ -473,7 +537,7 @@ mod rand {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .subsec_nanos();
         T::from(nanos)
     }
