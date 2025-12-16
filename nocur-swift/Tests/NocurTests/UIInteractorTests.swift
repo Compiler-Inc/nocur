@@ -28,8 +28,8 @@ final class UIInteractorTests: XCTestCase {
             tapCount: 1
         )
 
-        XCTAssertEqual(result.x, 200)
-        XCTAssertEqual(result.y, 400)
+        XCTAssertEqual(result.coordinates.x, 200, accuracy: 0.001)
+        XCTAssertEqual(result.coordinates.y, 400, accuracy: 0.001)
         XCTAssertNil(result.element)
     }
 
@@ -47,8 +47,8 @@ final class UIInteractorTests: XCTestCase {
             tapCount: 2
         )
 
-        XCTAssertEqual(result.x, 200)
-        XCTAssertEqual(result.y, 400)
+        XCTAssertEqual(result.coordinates.x, 200, accuracy: 0.001)
+        XCTAssertEqual(result.coordinates.y, 400, accuracy: 0.001)
     }
 
     // MARK: - Scroll Tests

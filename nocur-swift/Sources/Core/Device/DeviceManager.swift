@@ -6,7 +6,7 @@ import Foundation
 public struct DeviceInfo: Codable, Equatable {
     public let id: String              // UDID for simulators, xcodebuild-compatible UDID for physical
     public let coreDeviceId: String?   // CoreDevice UUID (only for physical devices, used by devicectl)
-    public let name: String            // "iPhone 16 Pro" or "Atharva's iPhone"
+    public let name: String            // "iPhone 16 Pro" or "Tester's iPhone"
     public let model: String           // "iPhone 16 Pro", "iPad Air"
     public let osVersion: String       // "18.0", "26.1"
     public let deviceType: DeviceType

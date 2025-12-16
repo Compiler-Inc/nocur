@@ -2,7 +2,7 @@
 name = "app"
 version = "0.1.0"
 description = "Nocur - AI-powered iOS development verification"
-authors = ["Atharva Vaidya"]
+authors = ["Compiler Inc"]
 license = "MIT"
 repository = "https://github.com/Compiler-Inc/nocur"
 edition = "2021"

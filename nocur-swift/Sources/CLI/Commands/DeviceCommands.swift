@@ -44,7 +44,7 @@ extension Device {
                       },
                       {
                         "id": "YYYYYYYY-YYYY-YYYY-YYYY-YYYYYYYYYYYY",
-                        "name": "Atharva's iPhone",
+                        "name": "Tester's iPhone",
                         "model": "iPhone 16 Pro",
                         "osVersion": "26.1",
                         "deviceType": "physical",

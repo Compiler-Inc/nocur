@@ -100,19 +100,20 @@ final class SimulatorControllerTests: XCTestCase {
         let result = try await controller.takeScreenshot(udid: nil, outputPath: nil)
 
         // Verify result
-        XCTAssertFalse(result.path.isEmpty, "Screenshot path should not be empty")
+        let path = try XCTUnwrap(result.path, "Screenshot path should not be nil")
+        XCTAssertFalse(path.isEmpty, "Screenshot path should not be empty")
         XCTAssertGreaterThan(result.width, 0, "Width should be positive")
         XCTAssertGreaterThan(result.height, 0, "Height should be positive")
         XCTAssertFalse(result.simulator.isEmpty, "Simulator name should not be empty")
 
         // Verify file exists
         XCTAssertTrue(
-            FileManager.default.fileExists(atPath: result.path),
-            "Screenshot file should exist at \(result.path)"
+            FileManager.default.fileExists(atPath: path),
+            "Screenshot file should exist at \(path)"
         )
 
         // Clean up
-        try? FileManager.default.removeItem(atPath: result.path)
+        try? FileManager.default.removeItem(atPath: path)
     }
 
     func testScreenshotWithCustomPath() async throws {
@@ -127,7 +128,8 @@ final class SimulatorControllerTests: XCTestCase {
 
         let result = try await controller.takeScreenshot(udid: nil, outputPath: customPath)
 
-        XCTAssertEqual(result.path, customPath, "Should use custom path")
+        let path = try XCTUnwrap(result.path, "Screenshot path should not be nil")
+        XCTAssertEqual(path, customPath, "Should use custom path")
         XCTAssertTrue(FileManager.default.fileExists(atPath: customPath))
 
         // Clean up

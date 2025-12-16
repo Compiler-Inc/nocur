@@ -162,10 +162,11 @@ public final class UIInteractor {
 
         // Clear existing text if requested
         if clearFirst {
-            // Use idb key events: select all (Cmd+A) then delete
-            _ = try await shell("idb", "ui", "key", "--udid", udid, "4", "--modifier", "command")  // Cmd+A
-            try await Task.sleep(nanoseconds: 100_000_000)
-            _ = try await shell("idb", "ui", "key", "--udid", udid, "42")  // Backspace
+            // idb `ui key` does not support modifier keys, so we clear by sending a
+            // sequence of backspaces to the currently focused element.
+            let backspaceCount = 64
+            let args = ["idb", "ui", "key-sequence", "--udid", udid] + Array(repeating: "42", count: backspaceCount)
+            _ = try await shell(args)
             try await Task.sleep(nanoseconds: 100_000_000)
         }
 

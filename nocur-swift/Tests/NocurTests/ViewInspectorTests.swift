@@ -29,7 +29,7 @@ final class ViewInspectorTests: XCTestCase {
         )
 
         // Verify result structure
-        XCTAssertEqual(result.captureMethod, "accessibility")
+        XCTAssertEqual(result.captureMethod, "idb_accessibility")
         XCTAssertNotNil(result.root)
         XCTAssertFalse(result.root.className.isEmpty)
     }
