@@ -143,7 +143,7 @@ const ResizeHandle = ({
 
 // Internal app content component that uses project context
 const AppContent = () => {
-  const { currentProject, showNewProjectModal, setShowNewProjectModal } = useProject();
+  const { currentProject } = useProject();
   
   // Derived project paths from context
   const PROJECT_PATH = currentProject?.path || DEFAULT_PROJECT_PATH;
@@ -803,11 +803,6 @@ const AppContent = () => {
         projectPath={ROOT_PROJECT_PATH}
       />
 
-      {/* New Project Modal */}
-      <NewProjectModal
-        isOpen={showNewProjectModal}
-        onClose={() => setShowNewProjectModal(false)}
-      />
     </div>
   );
 };
@@ -823,7 +818,7 @@ const App = () => {
 
 // App component that uses project context to decide what to show
 const AppWithProject = () => {
-  const { currentProject, isLoading } = useProject();
+  const { currentProject, isLoading, showNewProjectModal, setShowNewProjectModal } = useProject();
 
   // Show loading while context initializes
   if (isLoading) {
@@ -838,12 +833,15 @@ const AppWithProject = () => {
   }
 
   // Show welcome screen if no project is selected
-  if (!currentProject) {
-    return <WelcomeScreen />;
-  }
-
-  // Show main app content with project
-  return <AppContent />;
+  return (
+    <>
+      {!currentProject ? <WelcomeScreen /> : <AppContent />}
+      <NewProjectModal
+        isOpen={showNewProjectModal}
+        onClose={() => setShowNewProjectModal(false)}
+      />
+    </>
+  );
 };
 
 export default App;
