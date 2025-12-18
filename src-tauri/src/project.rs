@@ -37,7 +37,8 @@ pub struct RecentProjects {
 pub struct CreateProjectRequest {
     pub name: String,
     pub location: String,
-    pub bundle_id_prefix: String,
+    #[serde(default)]
+    pub bundle_id_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,7 +231,20 @@ pub fn validate_project(path: &str) -> Result<ProjectValidation, String> {
 // =============================================================================
 
 pub fn create_project(request: &CreateProjectRequest) -> Result<ProjectInfo, String> {
-    let project_dir = Path::new(&request.location).join(&request.name);
+    fn expand_tilde(path: &str) -> PathBuf {
+        if path == "~" {
+            return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+        }
+        if let Some(rest) = path.strip_prefix("~/") {
+            return dirs::home_dir()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| PathBuf::from(path));
+        }
+        PathBuf::from(path)
+    }
+
+    let location_dir = expand_tilde(&request.location);
+    let project_dir = location_dir.join(&request.name);
     
     // Check if directory already exists
     if project_dir.exists() {
@@ -252,7 +266,15 @@ pub fn create_project(request: &CreateProjectRequest) -> Result<ProjectInfo, Str
         .map_err(|e| format!("Failed to create source directory: {}", e))?;
     
     // Generate bundle ID
-    let bundle_id = format!("{}.{}", request.bundle_id_prefix, request.name.to_lowercase().replace("-", ""));
+    let bundle_id_prefix = request
+        .bundle_id_prefix
+        .as_deref()
+        .unwrap_or("com.example");
+    let bundle_id = format!(
+        "{}.{}",
+        bundle_id_prefix,
+        request.name.to_lowercase().replace("-", "")
+    );
     
     // Write Tuist.swift
     fs::write(

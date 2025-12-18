@@ -30,7 +30,6 @@ export interface ProjectValidation {
 export interface CreateProjectRequest {
   name: string;
   location: string;
-  bundleIdPrefix: string;
 }
 
 interface ProjectContextValue {

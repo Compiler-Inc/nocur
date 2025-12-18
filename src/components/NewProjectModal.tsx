@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useProject, CreateProjectRequest } from "@/lib/project-context";
 
+const DEFAULT_BUNDLE_ID_PREFIX = "com.example";
+
 interface NewProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -12,7 +14,6 @@ export const NewProjectModal = ({ isOpen, onClose }: NewProjectModalProps) => {
   
   const [name, setName] = useState("");
   const [location, setLocation] = useState("");
-  const [bundleIdPrefix, setBundleIdPrefix] = useState("com.example");
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -21,7 +22,6 @@ export const NewProjectModal = ({ isOpen, onClose }: NewProjectModalProps) => {
     if (isOpen) {
       setName("");
       setLocation("");
-      setBundleIdPrefix("com.example");
       setError(null);
     }
   }, [isOpen]);
@@ -49,6 +49,7 @@ export const NewProjectModal = ({ isOpen, onClose }: NewProjectModalProps) => {
       }
     } catch (err) {
       console.error("Failed to select location:", err);
+      setError("Couldn't open folder chooser. Check app permissions and try again.");
     }
   };
 
@@ -75,17 +76,12 @@ export const NewProjectModal = ({ isOpen, onClose }: NewProjectModalProps) => {
       setError("Please select a location for the project");
       return;
     }
-    if (!bundleIdPrefix.trim()) {
-      setError("Bundle ID prefix is required");
-      return;
-    }
 
     setIsCreating(true);
     try {
       const request: CreateProjectRequest = {
         name: name.trim(),
         location: location.trim(),
-        bundleIdPrefix: bundleIdPrefix.trim(),
       };
       await createProject(request);
       onClose();
@@ -98,7 +94,8 @@ export const NewProjectModal = ({ isOpen, onClose }: NewProjectModalProps) => {
 
   if (!isOpen) return null;
 
-  const generatedBundleId = bundleIdPrefix + "." + name.toLowerCase().replace(/-/g, "");
+  const generatedBundleId =
+    DEFAULT_BUNDLE_ID_PREFIX + "." + name.toLowerCase().replace(/-/g, "");
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -153,9 +150,8 @@ export const NewProjectModal = ({ isOpen, onClose }: NewProjectModalProps) => {
                 type="text"
                 value={location}
                 onChange={(e) => setLocation(e.target.value)}
-                placeholder="~/Developer"
+                placeholder="Choose a folder or paste a path"
                 className="flex-1 px-3 py-2 bg-surface-overlay border border-border rounded-lg text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors font-mono text-sm"
-                readOnly
               />
               <button
                 onClick={handleSelectLocation}
@@ -166,24 +162,18 @@ export const NewProjectModal = ({ isOpen, onClose }: NewProjectModalProps) => {
             </div>
           </div>
 
-          {/* Bundle ID Prefix */}
-          <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1.5">
-              Bundle ID Prefix
-            </label>
-            <input
-              type="text"
-              value={bundleIdPrefix}
-              onChange={(e) => setBundleIdPrefix(e.target.value)}
-              placeholder="com.example"
-              className="w-full px-3 py-2 bg-surface-overlay border border-border rounded-lg text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors"
-            />
-            {name && (
-              <p className="mt-1 text-xs text-text-tertiary">
-                Bundle ID: <span className="font-mono text-accent">{generatedBundleId}</span>
+          {/* Bundle ID (auto-generated) */}
+          {name && (
+            <div className="p-3 bg-surface-overlay rounded-lg border border-border">
+              <p className="text-xs font-medium text-text-secondary mb-1">Bundle ID</p>
+              <p className="text-xs text-text-tertiary">
+                <span className="font-mono text-accent">{generatedBundleId}</span>
               </p>
-            )}
-          </div>
+              <p className="mt-1 text-[11px] text-text-tertiary">
+                Auto-generated; you can change this later in Xcode/Tuist.
+              </p>
+            </div>
+          )}
 
           {/* Error */}
           {error && (
