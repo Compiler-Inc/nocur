@@ -85,6 +85,19 @@ interface GitInfo {
   workingDir: string;
 }
 
+function shortenPath(path: string): string {
+  if (!path) return "";
+  const home = "/Users/";
+  if (path.startsWith(home)) {
+    const afterHome = path.slice(home.length);
+    const userEnd = afterHome.indexOf("/");
+    if (userEnd > 0) {
+      return "~" + afterHome.slice(userEnd);
+    }
+  }
+  return path;
+}
+
 // Default paths used when no project is selected via context
 // These are fallbacks for development - users should select their own project
 const DEFAULT_PROJECT_PATH = "";
@@ -211,7 +224,7 @@ const AppContent = () => {
     fetchGitInfo();
     const interval = setInterval(fetchGitInfo, 5000); // Refresh every 5s
     return () => clearInterval(interval);
-  }, []);
+  }, [PROJECT_PATH]);
 
   // Auto-select first available device on mount
   useEffect(() => {
@@ -604,7 +617,9 @@ const AppContent = () => {
           </div>
           <div className="h-4 w-px bg-border" />
           <div className="flex items-center gap-2">
-            <span className="text-xs text-text-secondary font-mono">~/nocur/sample-app</span>
+            <span className="text-xs text-text-secondary font-mono">
+              {shortenPath(PROJECT_PATH)}
+            </span>
             {gitInfo && (
               <>
                 <span className="text-xs text-accent font-mono">{gitInfo.branch}</span>
