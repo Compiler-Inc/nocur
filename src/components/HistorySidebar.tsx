@@ -100,7 +100,16 @@ export const HistorySidebar = ({
       const info = await invoke<GitInfo>("get_git_info", { path: projectPath });
       setGitInfo(info);
     } catch (err) {
-      console.error("Failed to load git info:", err);
+      setGitInfo(null);
+      const message =
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : "";
+      if (!message.includes("Not a git repository")) {
+        console.error("Failed to load git info:", err);
+      }
     }
   }, [projectPath]);
 

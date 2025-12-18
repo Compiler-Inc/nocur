@@ -217,7 +217,17 @@ const AppContent = () => {
         const info = await invoke<GitInfo>("get_git_info", { path: PROJECT_PATH });
         setGitInfo(info);
       } catch (err) {
-        console.error("Failed to get git info:", err);
+        // Most commonly: the selected folder isn't a git repository.
+        setGitInfo(null);
+        const message =
+          typeof err === "string"
+            ? err
+            : err instanceof Error
+              ? err.message
+              : "";
+        if (!message.includes("Not a git repository")) {
+          console.error("Failed to get git info:", err);
+        }
       }
     };
 

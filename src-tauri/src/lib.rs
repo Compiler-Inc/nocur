@@ -1591,6 +1591,19 @@ async fn get_git_info(path: Option<String>) -> Result<GitInfo, String> {
             .unwrap_or_else(|_| ".".to_string())
     });
 
+    // Bail out early if this isn't a git worktree to avoid surfacing confusing "unknown" branches.
+    let is_repo_output = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&working_dir)
+        .output()
+        .map_err(|e| format!("Failed to run git: {}", e))?;
+
+    if !is_repo_output.status.success()
+        || String::from_utf8_lossy(&is_repo_output.stdout).trim() != "true"
+    {
+        return Err("Not a git repository".to_string());
+    }
+
     // Get current branch
     let branch_output = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1598,11 +1611,7 @@ async fn get_git_info(path: Option<String>) -> Result<GitInfo, String> {
         .output()
         .map_err(|e| format!("Failed to get branch: {}", e))?;
 
-    let branch = if branch_output.status.success() {
-        String::from_utf8_lossy(&branch_output.stdout).trim().to_string()
-    } else {
-        "unknown".to_string()
-    };
+    let branch = String::from_utf8_lossy(&branch_output.stdout).trim().to_string();
 
     // Get status (porcelain for easy parsing)
     let status_output = Command::new("git")

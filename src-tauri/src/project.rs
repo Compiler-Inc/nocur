@@ -341,6 +341,10 @@ pub fn create_project(request: &CreateProjectRequest) -> Result<ProjectInfo, Str
             eprintln!("Warning: Could not run tuist generate: {}. You may need to run it manually.", e);
         }
     }
+
+    // Initialize git repository (best-effort).
+    // This improves UX for worktrees and prevents "unknown" git status in the UI.
+    try_init_git_repo(&project_dir);
     
     let project_path = project_dir.to_string_lossy().to_string();
     
@@ -353,6 +357,62 @@ pub fn create_project(request: &CreateProjectRequest) -> Result<ProjectInfo, Str
         last_opened: Utc::now().timestamp(),
         project_type: ProjectType::Tuist,
     })
+}
+
+fn try_init_git_repo(project_dir: &Path) {
+    if project_dir.join(".git").exists() {
+        return;
+    }
+
+    let init_result = Command::new("git")
+        .arg("init")
+        .current_dir(project_dir)
+        .output();
+
+    match init_result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "Warning: git init failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not run git init: {}", e);
+            return;
+        }
+    }
+
+    let _ = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(project_dir)
+        .output();
+
+    // Only auto-commit if the user has git identity configured.
+    let user_name = Command::new("git")
+        .args(["config", "--get", "user.name"])
+        .current_dir(project_dir)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let user_email = Command::new("git")
+        .args(["config", "--get", "user.email"])
+        .current_dir(project_dir)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if user_name.is_empty() || user_email.is_empty() {
+        return;
+    }
+
+    let _ = Command::new("git")
+        .args(["commit", "-m", "Initial commit"])
+        .current_dir(project_dir)
+        .output();
 }
 
 fn is_valid_project_name(name: &str) -> bool {
